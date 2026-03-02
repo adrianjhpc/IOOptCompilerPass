@@ -128,8 +128,8 @@ namespace {
     errs() << "Successfully amalgamated writes using demangled C++/POSIX/C APIs!\n";
   }
 
-  // -----------------------------------------------------------------------------
-  // Hoisting reads
+// -----------------------------------------------------------------------------
+  // Hoisting reads (including cross-block CFG traversal)
   // -----------------------------------------------------------------------------
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
@@ -139,35 +139,58 @@ namespace {
     MemoryLocation DestLoc(Args.Buffer, ReadSize);
 
     Instruction *InsertPoint = ReadCall;
-    Instruction *Prev = ReadCall->getPrevNode();
+    Instruction *CurrentInst = ReadCall->getPrevNode();
+    BasicBlock *CurrentBB = ReadCall->getParent();
     
-    while (Prev) {
-      if (Prev->isTerminator() || isa<PHINode>(Prev)) break;
+    // We replace the simple while loop with an infinite loop that can jump blocks
+    while (true) {
+      
+      // Phase 1: Walk up the current Basic Block
+      if (CurrentInst) {
+        // We skip Phi nodes and Terminators, but we don't 'break' the whole loop anymore
+        if (!CurrentInst->isTerminator() && !isa<PHINode>(CurrentInst)) {
+          
+          bool DependsOnPrev = false;
+          for (Value *Op : ReadCall->operands()) {
+            if (Op == CurrentInst) { DependsOnPrev = true; break; }
+          }
+          if (DependsOnPrev) break; // Hit a strict dependency, must stop hoisting entirely.
 
-      bool DependsOnPrev = false;
-      for (Value *Op : ReadCall->operands()) {
-	if (Op == Prev) { DependsOnPrev = true; break; }
+          if (CurrentInst->mayReadOrWriteMemory()) {
+            if (isModOrRefSet(AA.getModRefInfo(CurrentInst, DestLoc))) break;
+            MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+            if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+          }
+          
+          // Safe to move past this instruction!
+          InsertPoint = CurrentInst;
+        }
+        CurrentInst = CurrentInst->getPrevNode();
+      } 
+      // Phase 2: We hit the top of the current block. Try to jump to the predecessor
+      else {
+        // Check if this block have exactly one block that feeds into it.
+        BasicBlock *PredBB = CurrentBB->getSinglePredecessor();
+        if (!PredBB) break; // Multiple paths lead here (e.g., end of an 'if'). Too dangerous to hoist.
+
+        // Check if the predecessor only feed into our current block
+        // (If it branches to other blocks, hoisting would be speculative execution!)
+        if (PredBB->getTerminator()->getNumSuccessors() > 1) break;
+
+        // It is a safe linear chain, so we can jump up to the predecessor block.
+        CurrentBB = PredBB;
+        CurrentInst = CurrentBB->getTerminator(); // Start at the bottom of the new block
       }
-      if (DependsOnPrev) break; 
-
-      if (Prev->mayReadOrWriteMemory()) {
-	if (isModOrRefSet(AA.getModRefInfo(Prev, DestLoc))) break;
-	MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
-	if (isModSet(AA.getModRefInfo(Prev, TargetLoc))) break;
-      }
-
-      InsertPoint = Prev;
-      Prev = Prev->getPrevNode();
     }
 
     if (InsertPoint != ReadCall) {
       ReadCall->moveBefore(InsertPoint->getIterator());
-      errs() << "Successfully hoisted a read call!\n";
+      errs() << "Successfully hoisted a read call across the CFG\n";
       return true;
     }
     return false;
   }
-
+  
   // ------------------------------------------------------------------------------------------
   // Loop I/O amalgamation for non-unit stride accesses (but still predictable ones) using SCEV
   // ------------------------------------------------------------------------------------------
