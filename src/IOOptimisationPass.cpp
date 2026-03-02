@@ -137,7 +137,7 @@ bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     }
 
     if (InsertPoint != ReadCall) {
-        ReadCall->moveBefore(InsertPoint);
+        ReadCall->moveBefore(InsertPoint->getIterator());
         errs() << "Successfully hoisted a read operation!\n";
         return true;
     }
