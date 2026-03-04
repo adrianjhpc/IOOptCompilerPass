@@ -44,3 +44,14 @@ target_compile_options(wal_standard PRIVATE -O3 -fno-inline)
 add_executable(wal_fast database_wal_benchmark.cpp)
 target_compile_options(wal_fast PRIVATE -O3 -fno-inline -fpass-plugin=$<TARGET_FILE:IOOpt>)
 add_dependencies(wal_fast IOOpt)
+
+# Multimedia streaming benchmark
+
+# Baseline
+add_executable(media_standard media_benchmark.cpp)
+target_compile_options(media_standard PRIVATE -O3 -fno-inline)
+
+# Optimized
+add_executable(media_fast media_benchmark.cpp)
+target_compile_options(media_fast PRIVATE -O3 -fno-inline -fpass-plugin=$<TARGET_FILE:IOOpt>)
+add_dependencies(media_fast IOOpt)
