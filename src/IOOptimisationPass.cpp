@@ -311,23 +311,32 @@ namespace {
 // -----------------------------------------------------------------------------
 // Pass plugin registration
 // -----------------------------------------------------------------------------
-extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING, [](PassBuilder &PB) {
-    
-    // Used by 'opt' in lit tests
-    PB.registerPipelineParsingCallback([](StringRef Name, FunctionPassManager &FPM, ...) {
-      if (Name == "io-opt") { FPM.addPass(IOOptimisationPass()); return true; }
-      return false;
-    });
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+    return {
+        LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING,
+        [](PassBuilder &PB) {
+            // Run via command line (opt -passes=io-opt)
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &FPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "io-opt") {
+                        FPM.addPass(IOOptimisationPass());
+                        return true;
+                    }
+                    return false;
+                });
 
-    // Insert into optimisations levels
-    PB.registerPipelineEarlySimplificationEPCallback(
-						     [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-						       if (Level != OptimizationLevel::O0) {
-							 FunctionPassManager FPM;
-							 FPM.addPass(IOOptimisationPass());
-							 MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-						       }
-						     });
-  }};
+            // Run at the end of the standard optimization pipeline
+            PB.registerOptimizerLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+                    MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
+                });
+
+            // Run during the Full Link-Time Optimization phase!
+            PB.registerFullLinkTimeOptimizationLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level) {
+                    MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
+                });
+        }};
 }
