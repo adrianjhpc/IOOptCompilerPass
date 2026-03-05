@@ -73,38 +73,35 @@ namespace {
       auto *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
       auto *Load2 = dyn_cast<LoadInst>(NewArgs.Target);
       if (Load1 && Load2 && Load1->getPointerOperand() == Load2->getPointerOperand()) {
-	TargetsMatch = true;
+        TargetsMatch = true;
       }
     }
     if (!TargetsMatch) return false;
 
     auto getPreciseLoc = [&](Value *Buf, Value *Len) {
       if (auto *C = dyn_cast<ConstantInt>(Len))
-	return MemoryLocation(Buf, LocationSize::precise(C->getZExtValue()));
+        return MemoryLocation(Buf, LocationSize::precise(C->getZExtValue()));
       return MemoryLocation::getBeforeOrAfter(Buf);
     };
 
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
 
-    // Check all instructions between the last batched write and this new one
     for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
       if (!I) return false;
       if (!I->mayReadOrWriteMemory()) continue;
         
-      // Does 'I' interfere with the new write's buffer?
       if (isModOrRefSet(AA.getModRefInfo(I, NewLoc))) return false;
         
-      // Does 'I' interfere with any buffer already in the batch?
       for (CallInst *BatchedCall : Batch) {
-	IOArgs BArgs = getIOArguments(BatchedCall);
-	MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-	if (isModOrRefSet(AA.getModRefInfo(I, BLoc))) return false;
+        IOArgs BArgs = getIOArguments(BatchedCall);
+        MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
+        if (isModOrRefSet(AA.getModRefInfo(I, BLoc))) return false;
       }
     }
     return true;
   }
 
-bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
+  bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     if (Batch.size() <= 1) {
       Batch.clear();
       return false;
@@ -113,7 +110,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     const DataLayout &DL = M->getDataLayout();
     bool AllContiguous = true;
     
-    // Check if the entire chain is contiguous
     for (size_t i = 0; i < Batch.size() - 1; ++i) {
       IOArgs A = getIOArguments(Batch[i]);
       IOArgs B = getIOArguments(Batch[i+1]);
@@ -126,18 +122,25 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     IOArgs FirstArgs = getIOArguments(Batch.front());
     bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD);
     
-    // writev/readv are raw OS system calls. 
-    // We cannot use them on C FILE* or C++ std::ostream pointers!
     if (!AllContiguous && FirstArgs.Type != IOArgs::POSIX_WRITE && FirstArgs.Type != IOArgs::POSIX_READ) {
         Batch.clear();
         return false;
     }
-    // --------------------------------------------------
+
+    // ====================================================================
+    // PROFITABILITY HEURISTIC
+    // Setting up an iovec array is expensive. Only perform non-contiguous
+    // vector merging if we are eliminating at least 2 system calls (batch >= 3).
+    // Contiguous merges avoid this entirely, so 2-way is fine for them.
+    // ====================================================================
+    if (!AllContiguous && Batch.size() < 3) {
+        Batch.clear();
+        return false;
+    }
 
     IRBuilder<> Builder(Batch.back());
 
     if (AllContiguous) {
-      // --- N-way contiguous merge functionality
       Value *TotalLen = FirstArgs.Length;
       for (size_t i = 1; i < Batch.size(); ++i) {
         TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
@@ -153,7 +156,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
       errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
         
     } else {
-      // --- N-way writev/readv (scatter/gather non-contiguous) merge functionality
       Type *Int32Ty = Builder.getInt32Ty();
       Type *PtrTy = PointerType::getUnqual(M->getContext());
       Type *SizeTy = DL.getIntPtrType(M->getContext());
@@ -165,7 +167,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
       StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
       ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
       
-      // Allocated the block before the loop
       Function *F = Batch.back()->getFunction();
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
       AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
@@ -187,7 +188,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     Batch.clear();
     return true;
   }
-  
   
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
@@ -260,69 +260,11 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     return Changed;
   }
 
-// ----------------------------------------------------------------------
-  // HELPER: Extends an existing writev/readv call with a new straggler IO
-  // ----------------------------------------------------------------------
-  bool mergeIntoVectorIO(CallInst *VecCall, CallInst *SingleCall, IRBuilder<> &Builder, Module *M, bool isRead, IOArgs SingleArgs) {
-    // We must know the size of the existing vector
-    ConstantInt *OldCnt = dyn_cast<ConstantInt>(VecCall->getArgOperand(2));
-    if (!OldCnt) return false; 
-    
-    int OldSize = OldCnt->getZExtValue();
-    int NewSize = OldSize + 1;
-    if (NewSize >= 1024) return false; // Respect OS IOV_MAX limits
-    
-    const DataLayout &DL = M->getDataLayout();
-    Type *Int32Ty = Builder.getInt32Ty();
-    Type *PtrTy = PointerType::getUnqual(M->getContext());
-    Type *SizeTy = DL.getIntPtrType(M->getContext());
-    
-    // Create the new, larger iovec array layout
-    StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
-    ArrayType *NewIovArrayTy = ArrayType::get(IovecTy, NewSize);
-    
-    Function *F = VecCall->getFunction();
-    IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
-    AllocaInst *NewIovArray = EntryBuilder.CreateAlloca(NewIovArrayTy, nullptr, "iovec.extended");
-    
-    // 1. Copy the old iovec array into the new one using LLVM MemCpy
-    uint64_t IovecSize = DL.getTypeAllocSize(IovecTy);
-    Builder.CreateMemCpy(NewIovArray, Align(8), VecCall->getArgOperand(1), Align(8), Builder.getInt64(OldSize * IovecSize));
-    
-    // 2. Append the straggler's buffer and length to the end
-    Value *NewIovPtr = Builder.CreateInBoundsGEP(NewIovArrayTy, NewIovArray, {Builder.getInt32(0), Builder.getInt32(OldSize)});
-    Builder.CreateStore(SingleArgs.Buffer, Builder.CreateStructGEP(IovecTy, NewIovPtr, 0));
-    Builder.CreateStore(Builder.CreateIntCast(SingleArgs.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, NewIovPtr, 1));
-    
-    // 3. Create the replacement vector call
-    StringRef FuncName = isRead ? "readv" : "writev";
-    FunctionType *VecTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
-    FunctionCallee VecFunc = M->getOrInsertFunction(FuncName, VecTy);
-    
-    Builder.CreateCall(VecFunc, {VecCall->getArgOperand(0), NewIovArray, Builder.getInt32(NewSize)});
-    errs() << "[IOOpt] SUCCESS: Straggler merged! " << FuncName << " extended to " << NewSize << " operations.\n";
-    
-    // 4. Clean up the old instructions
-    VecCall->eraseFromParent();
-    SingleCall->eraseFromParent();
-    return true;
-  }
-  
   struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
-    // Record when this is running in the LTO phase
-    bool IsLTOPhase;
-    
-    // Constructor defaults to LTO false for standard lit tests
-    IOOptimisationPass(bool IsLTOPhase = false) : IsLTOPhase(IsLTOPhase) {}
+    // Constructor no longer needs LTO phase tracking since we dropped Deferrals
+    IOOptimisationPass() {}
     
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-      // If we are in the local compile phase, and the Injector tagged this 
-      // function for inlining, DO not optimize it yet, save it for LTO.
-      if (!IsLTOPhase && F.hasFnAttribute(Attribute::AlwaysInline)) {
-	errs() << "[IOOpt] Deferring '" << F.getName() << "' for global LTO phase...\n";
-	return PreservedAnalyses::all();
-      }
-      
       errs() << "[IOOpt] Analyzing function: " << F.getName() << "\n";
       bool Changed = false;
       AAResults &AA = FAM.getResult<AAManager>(F);
@@ -332,11 +274,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
       
       for (Loop *L : LI) if (optimiseLoopIO(L, SE, DL)) Changed = true;
     
-      // ====================================================================
-      // PHASE 1: Hoist Reads
-      // We do this FIRST so that reads are safely grouped at the top of 
-      // the blocks before we attempt to calculate adjacency for batching.
-      // ====================================================================
       for (BasicBlock &BB : F) {
         for (Instruction &I : llvm::make_early_inc_range(BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
@@ -348,9 +285,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         }
       }
 
-      // ====================================================================
-      // PHASE 2: N-Way Merge (Batching)
-      // ====================================================================
       for (BasicBlock &BB : F) {
         std::vector<CallInst*> IOBatch;
 
@@ -362,15 +296,11 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
             bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD);
 
             if (isWrite || isRead) {
-              
-              // If the return value is used, we cannot safely batch it
-              // because readv/writev returns a single aggregate size.
               if (!Call->use_empty()) {
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
                 continue; 
               }      
               
-              // Prevent mixing reads and writes in the same batch
               if (!IOBatch.empty()) {
                 IOArgs BatchArgs = getIOArguments(IOBatch.front());
                 bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD);
@@ -379,22 +309,18 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
                 }
               }
 
-              // Batching Logic
               if (isSafeToAddToBatch(IOBatch, Call, AA, DL)) {
                 IOBatch.push_back(Call);
-                // Prevent hardware limits (POSIX IOV_MAX)
                 if (IOBatch.size() >= 1024) {
                   if (flushBatch(IOBatch, F.getParent())) Changed = true;
                 }
               } else {
-                // Hazard found so flush the current batch and start a new one
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
                 IOBatch.push_back(Call);
               }
             }
           }
         }
-        // Flush anything left at the end of the BasicBlock
         if (flushBatch(IOBatch, F.getParent())) Changed = true;
       }
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
@@ -402,29 +328,22 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
   };
 }
 
-// Heuristic injector pass
-// This pass scans the whole program before the inliner runs.
-// If it finds a small function that does I/O, it forces the compiler to inline it.
-// This is to try and expand lto optimisations to things that aren't inlined by heuristic.
 struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         bool Changed = false;
         
         for (Function &F : M) {
-            // Skip external declarations
             if (F.isDeclaration()) continue;
 
             unsigned InstCount = 0;
             bool HasIO = false;
 
-            // Analyze the function's contents
             for (BasicBlock &BB : F) {
                 for (Instruction &I : BB) {
                     InstCount++;
                     if (auto *Call = dyn_cast<CallInst>(&I)) {
                         if (Function *Callee = Call->getCalledFunction()) {
                             StringRef Name = Callee->getName();
-                            // Does it call a write function?
                             if (Name == "write" || Name == "writev" || Name == "fwrite") {
                                 HasIO = true;
                             }
@@ -433,8 +352,6 @@ struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
                 }
             }
 
-            // If the function has fewer than 30 instructions 
-            // it contains an I/O call, it is a wrapper. Force it to inline!
             if (HasIO && InstCount < 30 && !F.hasFnAttribute(Attribute::NoInline)) {
                 errs() << "[IOOpt-Injector] Tagging '" << F.getName() << "' for aggressive LTO inlining...\n";
                 F.addFnAttr(Attribute::AlwaysInline);
@@ -446,42 +363,35 @@ struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
     }
 };
 
-// -----------------------------------------------------------------------------
-// Pass plugin registration
-// -----------------------------------------------------------------------------
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return {
     LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING,
     [](PassBuilder &PB) {
       
-      // 1. lit testing (Local Phase)
       PB.registerPipelineParsingCallback(
         [](StringRef Name, FunctionPassManager &FPM,
            ArrayRef<PassBuilder::PipelineElement>) {
           if (Name == "io-opt") {
-            FPM.addPass(IOOptimisationPass(false)); // Local
+            FPM.addPass(IOOptimisationPass()); 
             return true;
           }
           return false;
         });
       
-      // 2. The Injector
       PB.registerPipelineStartEPCallback(
         [](ModulePassManager &MPM, OptimizationLevel Level) {
           MPM.addPass(IOWrapperInlinePass());
         });
       
-      // 3. Standard Optimizer (Local Phase)
       PB.registerOptimizerLastEPCallback(
         [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-          MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass(false))); // Local
+          MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
         });
       
-      // 4. LTO Optimizer (Global Phase!)
       PB.registerFullLinkTimeOptimizationLastEPCallback(
         [](ModulePassManager &MPM, OptimizationLevel Level) {
-          MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass(true))); // LTO!
+          MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
         });
     }};
 }

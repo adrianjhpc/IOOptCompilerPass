@@ -9,7 +9,7 @@
 
 // RUN: llvm-link-20 %t.main.bc %t.logger.bc -o %t.merged.bc
 
-// RUN: opt-20 -load-pass-plugin=/home/adrianj/IOCompiler/build/src/libIOOpt.so -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | FileCheck-20 %s
+// RUN: opt-20 -load-pass-plugin=../build/src/libIOOpt.so -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | FileCheck-20 %s
 #include <unistd.h>
 #include <string.h>
 
