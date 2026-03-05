@@ -260,6 +260,50 @@ namespace {
     return Changed;
   }
 
+  bool sinkWrite(CallInst *WriteCall, AAResults &AA, const DataLayout &DL) {
+    IOArgs Args = getIOArguments(WriteCall);
+    if (!Args.Buffer) return false;
+    
+    // We only care if the buffer is MODIFIED. Reading it is fine since 
+    // sinking the write doesn't change the buffer's contents.
+    MemoryLocation SrcLoc(Args.Buffer, LocationSize::beforeOrAfterPointer());
+    Instruction *InsertPoint = WriteCall;
+    Instruction *CurrentInst = WriteCall->getNextNode();
+    
+    while (CurrentInst) {
+      // 1. Stop at the end of the block
+      if (CurrentInst->isTerminator() || isa<PHINode>(CurrentInst)) break;
+      
+      // 2. Stop if the instruction might trap/throw (don't delay writes past potential crashes)
+      if (CurrentInst->mayThrow()) break;
+      
+      // 3. Stop if we hit another I/O call (preserves strict I/O ordering)
+      if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
+        if (getIOArguments(CI).Type != IOArgs::NONE) break;
+      }
+      
+      // 4. Check memory hazards
+      if (CurrentInst->mayReadOrWriteMemory()) {
+        // If the instruction MODIFIES our buffer, we must write it BEFORE this happens!
+        if (isModSet(AA.getModRefInfo(CurrentInst, SrcLoc))) break;
+        
+        // If it modifies the file descriptor / target pointer, we must stop
+        MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+        if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+      }
+      
+      InsertPoint = CurrentInst;
+      CurrentInst = CurrentInst->getNextNode();
+    }
+    
+    // If we found a valid spot further down, sink it!
+    if (InsertPoint != WriteCall) {
+      WriteCall->moveAfter(InsertPoint);
+      return true;
+    }
+    return false;
+  }
+  
   struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
     // Constructor no longer needs LTO phase tracking since we dropped Deferrals
     IOOptimisationPass() {}
@@ -285,6 +329,17 @@ namespace {
         }
       }
 
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : llvm::make_early_inc_range(llvm::reverse(BB))) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+            IOArgs CArgs = getIOArguments(Call);
+            if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE) {
+              if (sinkWrite(Call, AA, DL)) Changed = true;
+            }
+          }
+        }
+      }
+      
       for (BasicBlock &BB : F) {
         std::vector<CallInst*> IOBatch;
 
