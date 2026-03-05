@@ -326,12 +326,18 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     while (CurrentInst) {
       // 1. Stop at the end of the block
       if (CurrentInst->isTerminator() || isa<PHINode>(CurrentInst)) break;
-      
-      // 2. Stop if the instruction might trap/throw (don't delay writes past potential crashes)
+
+      // 2. Stop if the instruction might trap/throw
       if (CurrentInst->mayThrow()) break;
       
-      // 3. Stop if we hit another I/O call (preserves strict I/O ordering)
+      // 3. Stop if we hit another I/O call OR a memory lifetime boundary!
       if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
+        // Prevent perfectly adjacent writes from being pulled apart by scope closures
+        if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
+            CI->getIntrinsicID() == Intrinsic::lifetime_start) {
+            break;
+        }
+        // Preserves strict I/O ordering
         if (getIOArguments(CI).Type != IOArgs::NONE) break;
       }
       
