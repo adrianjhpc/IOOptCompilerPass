@@ -311,6 +311,9 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
   }
 
   bool sinkWrite(CallInst *WriteCall, AAResults &AA, const DataLayout &DL) {
+
+    if (!WriteCall->use_empty()) return false;
+    
     IOArgs Args = getIOArguments(WriteCall);
     if (!Args.Buffer) return false;
     
