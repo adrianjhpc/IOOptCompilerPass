@@ -88,10 +88,21 @@ namespace {
 
     for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
       if (!I) return false;
+
+      if (auto *CI = dyn_cast<CallInst>(I)) {
+          if (CI->getIntrinsicID() == Intrinsic::lifetime_end ||
+              CI->getIntrinsicID() == Intrinsic::lifetime_start) {
+              return false;
+          }
+          if (getIOArguments(CI).Type != IOArgs::NONE) return false;
+
+          if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+      }
+
       if (!I->mayReadOrWriteMemory()) continue;
-      
+
       if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
-      
+
       for (CallInst *BatchedCall : Batch) {
         IOArgs BArgs = getIOArguments(BatchedCall);
         MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
@@ -102,6 +113,7 @@ namespace {
           if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
       }
     }
+    
     return true;
   } 
 

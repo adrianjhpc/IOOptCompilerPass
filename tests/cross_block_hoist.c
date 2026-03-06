@@ -3,7 +3,7 @@
 #include <unistd.h>
 
 // -----------------------------------------------------------------------------
-// POSITIVE TEST: Linear CFG (Unconditional Jumps)
+// Negative test: Linear CFG (unconditional jumps)
 // -----------------------------------------------------------------------------
 // CHECK-LABEL: @test_cross_block_hoist
 int test_cross_block_hoist(int fd, int x) {
@@ -26,16 +26,16 @@ final_block:
 }
 
 // -----------------------------------------------------------------------------
-// NEGATIVE TEST: Speculative CFG (Conditional Jumps)
+// Negative test: Speculative CFG (conditional jumps)
 // -----------------------------------------------------------------------------
 // CHECK-LABEL: @test_no_speculative_hoist
 int test_no_speculative_hoist(int fd, int cond) {
     char buf[20];
     
-    // FileCheck asserts that the branch (the 'if' check) happens FIRST.
+    // FileCheck asserts that the branch (the 'if' check) happens first
     // CHECK: br i1 %{{.*}}
     
-    // And the read stays trapped safely inside the 'if' block!
+    // And the read stays trapped safely inside the 'if' block
     // CHECK: call i64 @read
     if (cond) {
         read(fd, buf, 20);

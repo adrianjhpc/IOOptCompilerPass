@@ -10,12 +10,15 @@ void write_log_payload(int fd, const char* message);
 __attribute__((noinline))
 void process_request(int fd) {
     const char* header = "[SYS-LOG] Request Processed: ";
-    
+
     // Write 1: The header (Happens here in main)
     write(fd, header, 29);
-    
+
     // Write 2 & 3: The payload (Happens in the external library)
     write_log_payload(fd, "User successfully authenticated and session created.");
+
+    // Write 4: The final footer (Triggers N>=4 batching post-LTO inlining)
+    write(fd, " [DONE]\n", 8);
 }
 
 int main() {

@@ -10,7 +10,7 @@ void test_posix_write(int fd) {
     // Note: LLVM treats size_t as i64 on 64-bit platforms.
     // CHECK: call i64 @write(i32 {{.*}}, ptr {{.*}}, i64 20)
     
-    // FileCheck asserts that we do not  see another write after it.
+    // FileCheck asserts that we do not see another write after it.
     // CHECK-NOT: call i64 @write
     write(fd, buf, 10);
     write(fd, buf + 10, 10);

@@ -20,15 +20,17 @@ void write_wal_record(int fd, uint64_t tx_id, const char* row_data, uint32_t siz
     hdr.tx_id = tx_id;
     hdr.payload_size = size;
     hdr.checksum = 0xDEADBEEF;          // Simulated checksum
-    
+
     // Add a simulated trailing footer/checksum block
     uint32_t block_footer = 0xCAFEBABE;
+    uint32_t end_marker = 0xFFFFFFFF;
 
-    // The torture test: 3 scattered writes.
-    // The pass will now see this is >= 3 and vectorize it!
+    // The torture test: 4 scattered writes.
+    // The sizes are dynamic (row_data size), so the pass requires N>=4.
     write(fd, &hdr, sizeof(LogHeader));
     write(fd, row_data, size);
-    write(fd, &block_footer, sizeof(uint32_t)); 
+    write(fd, &block_footer, sizeof(uint32_t));
+    write(fd, &end_marker, sizeof(uint32_t)); 
 }
 
 int main() {
@@ -43,7 +45,7 @@ int main() {
     uint32_t row_size = 512;
     char* row_data = (char*)malloc(row_size);
     memset(row_data, 'D', row_size - 1);
-    row_data[row_size - 1] = '\n'; 
+    row_data[row_size - 1] = '\n';
 
     // Simulate 100,000 database transactions
     int num_transactions = 100000;

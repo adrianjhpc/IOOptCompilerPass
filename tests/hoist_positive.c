@@ -10,8 +10,8 @@ int test_hoist(FILE *fp, int x, int y) {
     int z = x * y + 42;
     int w = z / 2;
     
-    // In the C code, fread happens AFTER the math.
-    // But our pass should hoist it to happen BEFORE the math in the IR.
+    // In the C code, fread happens after the math
+    // But our pass should hoist it to happen before the math in the IR
     
     // CHECK: call i64 @fread
     // CHECK: mul nsw i32

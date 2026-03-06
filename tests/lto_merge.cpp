@@ -19,18 +19,22 @@ __attribute__((always_inline)) void write_payload(int fd, const char* data);
 int main() {
     int fd = 1; // dummy fd (stdout)
     const char* header = "[LOG ENTRY]: ";
-    
+
     // Write 1: Happens here in main.cpp
     write(fd, header, strlen(header));
-    
-    // Write 2 & 3: Happen inside logger.cpp. 
+
+    // Write 2 & 3: Happen inside logger.cpp.
     // Without LTO, the compiler cannot merge these
     write_payload(fd, "Cross-module LTO is working!");
+
+    // Write 4: Add a footer to trigger the safe threshold (N>=4) for dynamic sizes
+    const char* footer = " [DONE]\n";
+    write(fd, footer, strlen(footer));
 
     return 0;
 }
 
 // --- VERIFICATION ---
-// We expect the LTO linker to successfully inline write_payload 
-// and merge all 3 scattered writes into a single writev call.
-// CHECK: [IOOpt] SUCCESS: N-Way converted 3 writes to writev!
+// We expect the LTO linker to successfully inline write_payload
+// and merge all 4 scattered writes into a single writev call.
+// CHECK: [IOOpt] SUCCESS: N-Way converted 4 writes to writev!

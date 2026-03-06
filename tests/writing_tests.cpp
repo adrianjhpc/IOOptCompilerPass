@@ -17,15 +17,18 @@ NOINLINE void test_contiguous_write(int fd) {
 
 // CHECK-LABEL: define {{.*}}test_non_contiguous_write
 NOINLINE void test_non_contiguous_write(int fd) {
-    char buf1[5] = "AAAA";
-    char buf2[5] = "BBBB";
-    char buf3[5] = "CCCC";
+    char buf1[50] = {0};
+    char buf2[50] = {0};
+    char buf3[50] = {0};
 
     // CHECK: %iovec.array.N = alloca [3 x { ptr, i64 }]
     // CHECK: call {{.*}} @writev(i32 {{.*}}, ptr %iovec.array.N, i32 3)
-    write(fd, buf1, 2);
-    write(fd, buf2, 2);
-    write(fd, buf3, 2);
+    
+    // 3 writes * 50 bytes = 150 bytes total. 
+    // 150 > 128, so the Dynamic Cost Model threshold drops to 3 and vectorizes
+    write(fd, buf1, 50);
+    write(fd, buf2, 50);
+    write(fd, buf3, 50);
 }
 
 int main() {

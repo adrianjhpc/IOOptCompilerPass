@@ -6,7 +6,7 @@
 #include <stdlib.h>
 
 // A dummy CRC function. We calculate this before the writes so 
-// the compiler doesn't interleave heavy memory reads between our system calls!
+// the compiler doesn't interleave heavy memory reads between our system calls
 uint32_t calculate_crc(const char* type, const char* data, uint32_t len) {
     uint32_t crc = 0;
     for(int i = 0; i < 4; ++i) crc ^= type[i];
@@ -20,13 +20,10 @@ void write_chunk(int fd, const char* chunk_type, const char* chunk_data, uint32_
     uint32_t length = data_len;
     uint32_t crc = calculate_crc(chunk_type, chunk_data, data_len);
 
-    // The Ultimate Torture Test: 4 writes, 3 different memory zones.
     // Buffer 1: Stack (length)
     // Buffer 2: Read-Only Data (chunk_type "mdat")
     // Buffer 3: Heap (chunk_data)
     // Buffer 4: Stack (crc)
-    //
-    // Your pass should emit: writev(fd, [{&length, 4}, {type, 4}, {data, len}, {&crc, 4}], 4);
     write(fd, &length, sizeof(length));
     write(fd, chunk_type, 4);
     write(fd, chunk_data, data_len);
