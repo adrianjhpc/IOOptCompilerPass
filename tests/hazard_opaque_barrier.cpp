@@ -2,14 +2,14 @@
 
 #include <unistd.h>
 
-// An unknown external function (could be writing to network, disk, or mutating state)
-extern void external_side_effect_func();
+// Use extern "C" to prevent C++ name mangling in the LLVM IR!
+extern "C" void external_side_effect_func();
 
 // CHECK-LABEL: define {{.*}}test_opaque_barrier
 __attribute__((noinline))
 void test_opaque_barrier(int fd, const char* str1, size_t len1, const char* str2, size_t len2) {
     
-    // The pass much not merge these writes into a writev or shadow buffer.
+    // The pass must not merge these writes into a writev or shadow buffer.
     // The external function acts as an impenetrable wall.
     
     // CHECK-NOT: alloca [{{.*}} x { ptr, i64 }]
