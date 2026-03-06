@@ -12,7 +12,10 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include "llvm/IR/Dominators.h"
+
 #include <vector>
+#include <map>
 
 using namespace llvm;
 
@@ -58,7 +61,7 @@ namespace {
     return false;
   }
 
-bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
+ bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
     if (Batch.empty()) return true;
     
     CallInst *LastCall = Batch.back();
@@ -84,30 +87,39 @@ bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, 
     };
 
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
+    BasicBlock *LastBB = LastCall->getParent();
+    BasicBlock *NewBB = NewCall->getParent();
 
-    for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
-      if (!I) return false;
-      if (!I->mayReadOrWriteMemory()) continue;
-        
-      // THE FIX: We only abort if an instruction MODIFIES (isModSet) the buffer.
-      // Intervening reads (Ref) are perfectly safe!
+    auto CheckInst = [&](Instruction *I) {
+      if (!I->mayReadOrWriteMemory()) return true;
       if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
-        
       for (CallInst *BatchedCall : Batch) {
         IOArgs BArgs = getIOArguments(BatchedCall);
         MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
         if (isModSet(AA.getModRefInfo(I, BLoc))) return false;
       }
-
-      // Ensure the Target (like the FILE* struct) isn't modified
       if (FirstArgs.Target->getType()->isPointerTy()) {
           MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
           if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
       }
+      return true;
+    };
+
+    if (LastBB == NewBB) {
+      for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
+        if (!I) return false; 
+        if (!CheckInst(I)) return false;
+      }
+    } else {
+      for (Instruction *I = LastCall->getNextNode(); I != nullptr; I = I->getNextNode()) {
+        if (!CheckInst(I)) return false;
+      }
+      for (Instruction *I = &NewBB->front(); I != NewCall; I = I->getNextNode()) {
+        if (!CheckInst(I)) return false;
+      }
     }
     return true;
-  }
-  
+  } 
 
 bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     if (Batch.size() <= 1) {
@@ -135,9 +147,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         return false;
     }
 
-    // --- SHADOW BUFFERING CHECK ---
-    // If we have exactly 2 scattered writes with known, small constant sizes,
-    // we can merge them by copying them into a local stack buffer!
     bool CanShadowBuffer = false;
     uint64_t TotalConstSize = 0;
     if (!AllContiguous && Batch.size() == 2 && !isRead) {
@@ -151,8 +160,7 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         }
     }
 
-    // Heuristic: Must be contiguous, N>=3 for vector, or eligible for Shadow Buffering
-    if (!AllContiguous && Batch.size() < 3 && !CanShadowBuffer) {
+    if (!AllContiguous && Batch.size() < 4 && !CanShadowBuffer) {
         Batch.clear();
         return false;
     }
@@ -175,9 +183,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
       errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
         
     } else if (CanShadowBuffer) {
-      // ====================================================================
-      // SHADOW BUFFERING EXECUTION
-      // ====================================================================
       Function *F = Batch.back()->getFunction();
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
       
@@ -317,36 +322,27 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     IOArgs Args = getIOArguments(WriteCall);
     if (!Args.Buffer) return false;
     
-    // We only care if the buffer is MODIFIED. Reading it is fine since 
-    // sinking the write doesn't change the buffer's contents.
     MemoryLocation SrcLoc(Args.Buffer, LocationSize::beforeOrAfterPointer());
     Instruction *InsertPoint = WriteCall;
     Instruction *CurrentInst = WriteCall->getNextNode();
     
     while (CurrentInst) {
-      // 1. Stop at the end of the block
       if (CurrentInst->isTerminator() || isa<PHINode>(CurrentInst)) break;
 
-      // 2. Stop if the instruction might trap/throw
       if (CurrentInst->mayThrow()) break;
       
-      // 3. Stop if we hit another I/O call OR a memory lifetime boundary!
       if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
         // Prevent perfectly adjacent writes from being pulled apart by scope closures
         if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
             CI->getIntrinsicID() == Intrinsic::lifetime_start) {
             break;
         }
-        // Preserves strict I/O ordering
         if (getIOArguments(CI).Type != IOArgs::NONE) break;
       }
       
-      // 4. Check memory hazards
       if (CurrentInst->mayReadOrWriteMemory()) {
-        // If the instruction MODIFIES our buffer, we must write it BEFORE this happens!
         if (isModSet(AA.getModRefInfo(CurrentInst, SrcLoc))) break;
         
-        // If it modifies the file descriptor / target pointer, we must stop
         MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
         if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
       }
@@ -364,15 +360,37 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
   }
   
   struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
-    // Constructor no longer needs LTO phase tracking since we dropped Deferrals
     IOOptimisationPass() {}
     
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       errs() << "[IOOpt] Analyzing function: " << F.getName() << "\n";
+
+
+      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+      int ioCount = 0;
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+            if (getIOArguments(Call).Type != IOArgs::NONE) {
+              ioCount++;
+              if (ioCount >= 2) break; // We only need to know if there are at least 2
+            }
+          }
+        }
+        if (ioCount >= 2) break;
+      }
+
+      // If there are fewer than 2 I/O operations in this entire function, 
+      // batching is impossible. Bail out immediately to preserve the native 
+      // CPU instruction scheduling!
+      if (ioCount < 2 && LI.empty()) {
+        return PreservedAnalyses::all(); 
+      }
+
+      errs() << "[IOOpt] Analyzing function: " << F.getName() << " (Found " << ioCount << "+ I/O ops)\n";
       bool Changed = false;
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
-      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
       
       for (Loop *L : LI) if (optimiseLoopIO(L, SE, DL)) Changed = true;
@@ -398,23 +416,33 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
           }
         }
       }
-      
-      for (BasicBlock &BB : F) {
+    
+      DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+      std::map<BasicBlock*, std::vector<CallInst*>> LiveBatches;
+
+      // We use a recursive lambda to traverse the tree Top-Down
+      std::function<void(DomTreeNode*)> traverseDomTree = [&](DomTreeNode *Node) {
+        BasicBlock *BB = Node->getBlock();
         std::vector<CallInst*> IOBatch;
 
-        for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        BasicBlock *Pred = BB->getSinglePredecessor();
+        if (Pred && LiveBatches.count(Pred)) {
+            IOBatch = std::move(LiveBatches[Pred]);
+            LiveBatches.erase(Pred);
+        }
+
+        for (Instruction &I : llvm::make_early_inc_range(*BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs CArgs = getIOArguments(Call);
-            
             bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE);
             bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD);
 
             if (isWrite || isRead) {
               if (!Call->use_empty()) {
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
-                continue; 
-              }      
-              
+                continue;
+              }
+
               if (!IOBatch.empty()) {
                 IOArgs BatchArgs = getIOArguments(IOBatch.front());
                 bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD);
@@ -435,8 +463,21 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
             }
           }
         }
-        if (flushBatch(IOBatch, F.getParent())) Changed = true;
-      }
+
+        BasicBlock *Succ = BB->getSingleSuccessor();
+        if (Succ && Succ->getSinglePredecessor() == BB) {
+            LiveBatches[BB] = std::move(IOBatch);
+        } else {
+            if (flushBatch(IOBatch, F.getParent())) Changed = true;
+        }
+
+        for (auto *Child : *Node) {
+            traverseDomTree(Child);
+        }
+      };
+
+      traverseDomTree(DT.getRootNode());
+
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
   };
@@ -466,7 +507,7 @@ struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
                 }
             }
 
-            if (HasIO && InstCount < 30 && !F.hasFnAttribute(Attribute::NoInline)) {
+            if (HasIO && InstCount < 10 && !F.hasFnAttribute(Attribute::NoInline)) {
                 errs() << "[IOOpt-Injector] Tagging '" << F.getName() << "' for aggressive LTO inlining...\n";
                 F.addFnAttr(Attribute::AlwaysInline);
                 Changed = true;
