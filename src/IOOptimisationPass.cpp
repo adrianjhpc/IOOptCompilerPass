@@ -12,10 +12,22 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include "llvm/Support/CommandLine.h"
 
 #include <vector>
 
 using namespace llvm;
+
+// Expose tunable parameters to the command line
+static cl::opt<unsigned> IOBatchThreshold(
+    "io-batch-threshold", 
+    cl::desc("Minimum number of scattered I/O operations to trigger writev"), 
+    cl::init(4));
+
+static cl::opt<unsigned> IOShadowBufferSize(
+    "io-shadow-buffer-max", 
+    cl::desc("Maximum bytes to allocate on the stack for shadow buffering"), 
+    cl::init(4096));
 
 namespace {
 
@@ -117,15 +129,28 @@ namespace {
     return true;
   } 
 
-bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
-    if (Batch.size() <= 1) {
-      Batch.clear();
-      return false;
-    }
 
-    const DataLayout &DL = M->getDataLayout();
+// ====================================================================
+  // 1. Define the I/O Patterns
+  // ====================================================================
+  enum class IOPattern {
+    Contiguous,   // Perfectly sequential memory (array[0], array[1])
+    ShadowBuffer, // Small scattered writes we can safely pack on the stack
+    Vectored,     // Heavy scattered I/O (Requires readv/writev arrays)
+    Unprofitable  // Too few calls or lacks byte-weight. Do not optimise
+  };
+
+  // ====================================================================
+  // Classifier: Analyes the batch and decides the best strategy
+  // ====================================================================
+  IOPattern classifyBatch(const std::vector<CallInst*> &Batch, const DataLayout &DL, uint64_t &OutTotalConstSize) {
+    if (Batch.size() <= 1) return IOPattern::Unprofitable;
+
+    IOArgs FirstArgs = getIOArguments(Batch.front());
+    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD);
+
+    // Pattern A: Is it perfectly contiguous?
     bool AllContiguous = true;
-    
     for (size_t i = 0; i < Batch.size() - 1; ++i) {
       IOArgs A = getIOArguments(Batch[i]);
       IOArgs B = getIOArguments(Batch[i+1]);
@@ -134,136 +159,163 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         break;
       }
     }
+    if (AllContiguous) return IOPattern::Contiguous;
 
-    IOArgs FirstArgs = getIOArguments(Batch.front());
-    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD);
-    
-    if (!AllContiguous && FirstArgs.Type != IOArgs::POSIX_WRITE && FirstArgs.Type != IOArgs::POSIX_READ) {
-        Batch.clear();
-        return false;
+    // If it's not contiguous, we can't batch basic reads/writes without vectoring support
+    if (FirstArgs.Type != IOArgs::POSIX_WRITE && FirstArgs.Type != IOArgs::POSIX_READ) {
+      return IOPattern::Unprofitable;
     }
 
-    bool CanShadowBuffer = false;
+    // Evaluate dynamic sizes and byte-weight
+    size_t DynamicThreshold = IOBatchThreshold; 
     uint64_t TotalConstSize = 0;
-    if (!AllContiguous && Batch.size() == 2 && !isRead) {
-        auto *C1 = dyn_cast<ConstantInt>(getIOArguments(Batch[0]).Length);
-        auto *C2 = dyn_cast<ConstantInt>(getIOArguments(Batch[1]).Length);
-        if (C1 && C2) {
-            TotalConstSize = C1->getZExtValue() + C2->getZExtValue();
-            if (TotalConstSize > 0 && TotalConstSize <= 4096) { 
-                CanShadowBuffer = true;
-            }
-        }
+    bool AllSizesConstant = true;
+
+    for (CallInst *C : Batch) {
+      if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
+        TotalConstSize += CI->getZExtValue();
+      } else {
+        AllSizesConstant = false;
+      }
     }
+    
+    // Export the total size so the Router can use it for Shadow Buffering
+    OutTotalConstSize = TotalConstSize;
 
-    size_t DynamicThreshold = 4;
-
+    // Apply the Asymmetric Cost Model
     if (isRead) {
-        DynamicThreshold = 2; 
+      DynamicThreshold = 2; // Reads always profit from VFS prefetching
     } else {
-        Function *F = Batch.back()->getFunction();
-        if (F->getInstructionCount() > 150) {
-            DynamicThreshold = 3; 
-        }
-
-        uint64_t KnownTotalSize = 0;
-        bool AllSizesConstant = true;
-        for (CallInst *C : Batch) {
-            if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
-                KnownTotalSize += CI->getZExtValue();
-            } else {
-                AllSizesConstant = false;
-            }
-        }
-        
-        if (AllSizesConstant && KnownTotalSize > 128) {
-            DynamicThreshold = 3;
-        }
+      Function *F = Batch.back()->getFunction();
+      if (F->getInstructionCount() > 150) DynamicThreshold = 3;
+      if (AllSizesConstant && TotalConstSize > 128) DynamicThreshold = 3;
     }
 
-    if (!AllContiguous && Batch.size() < DynamicThreshold && !CanShadowBuffer) {
-        Batch.clear();
-        return false;
+    // Pattern B: Vectored I/O (Meets the strict profitable threshold)
+    if (Batch.size() >= DynamicThreshold) {
+      return IOPattern::Vectored;
+    }
+
+    // Pattern C: Shadow Buffer (Fails vectored threshold, but small enough to pack manually)
+    if (!isRead && AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= IOShadowBufferSize) {
+      return IOPattern::ShadowBuffer;
+    }
+
+    // Pattern D: Not profitable
+    return IOPattern::Unprofitable;
+  }
+
+  // ====================================================================
+  // 3. The Router: Executes the IR transformations based on the Classifier
+  // ====================================================================
+  bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
+    if (Batch.empty()) return false;
+
+    const DataLayout &DL = M->getDataLayout();
+    uint64_t TotalConstSize = 0;
+    
+    // Ask the Classifier what to do!
+    IOPattern Pattern = classifyBatch(Batch, DL, TotalConstSize);
+
+    if (Pattern == IOPattern::Unprofitable) {
+      Batch.clear();
+      return false; // Safely bail out without altering IR
     }
 
     IRBuilder<> Builder(Batch.back());
+    IOArgs FirstArgs = getIOArguments(Batch.front());
+    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD);
 
-    if (AllContiguous) {
-      Value *TotalLen = FirstArgs.Length;
-      for (size_t i = 1; i < Batch.size(); ++i) {
-        TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
+    // Route to the highly specialized emission logic
+    switch (Pattern) {
+      case IOPattern::Contiguous: {
+        Value *TotalLen = FirstArgs.Length;
+        for (size_t i = 1; i < Batch.size(); ++i) {
+          TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
+        }
+          
+        std::vector<Value *> NewArgs;
+        if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
+          NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
+        } else {
+          NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen};
+        }
+        Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+        errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
+        break;
       }
-        
-      std::vector<Value *> NewArgs;
-      if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
-        NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
-      } else {
-        NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen};
-      }
-      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-      errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
-        
-    } else if (CanShadowBuffer) {
-      Function *F = Batch.back()->getFunction();
-      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
-      
-      Type *Int8Ty = Builder.getInt8Ty();
-      ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
-      AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
-      
-      uint64_t Offset = 0;
-      for (size_t i = 0; i < Batch.size(); ++i) {
-        IOArgs Args = getIOArguments(Batch[i]);
-        uint64_t Len = cast<ConstantInt>(Args.Length)->getZExtValue();
-        Value *DestPtr = Builder.CreateInBoundsGEP(ShadowArrTy, ShadowBuf, {Builder.getInt32(0), Builder.getInt32(Offset)});
-        Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
-        Offset += Len;
-      }
-      
-      Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
-      std::vector<Value *> NewArgs;
-      if (FirstArgs.Type == IOArgs::C_FWRITE) {
-        NewArgs = {ShadowBuf, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
-      } else {
-        NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal};
-      }
-      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-      errs() << "[IOOpt] SUCCESS: Shadow Buffered 2 writes into 1 (" << TotalConstSize << " bytes)!\n";
 
-    } else {
-      Type *Int32Ty = Builder.getInt32Ty();
-      Type *PtrTy = PointerType::getUnqual(M->getContext());
-      Type *SizeTy = DL.getIntPtrType(M->getContext());
-      
-      StringRef FuncName = isRead ? "readv" : "writev";
-      FunctionType *VecTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
-      FunctionCallee VecFunc = M->getOrInsertFunction(FuncName, VecTy);
-      
-      StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
-      ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
-      
-      Function *F = Batch.back()->getFunction();
-      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
-      AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
-      
-      for (size_t i = 0; i < Batch.size(); ++i) {
-        IOArgs Args = getIOArguments(Batch[i]);
-        Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
-        Builder.CreateStore(Args.Buffer, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
-        Builder.CreateStore(Builder.CreateIntCast(Args.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
+      case IOPattern::ShadowBuffer: {
+        Function *F = Batch.back()->getFunction();
+        IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+        
+        Type *Int8Ty = Builder.getInt8Ty();
+        ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
+        AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
+        
+        uint64_t Offset = 0;
+        for (size_t i = 0; i < Batch.size(); ++i) {
+          IOArgs Args = getIOArguments(Batch[i]);
+          uint64_t Len = cast<ConstantInt>(Args.Length)->getZExtValue();
+          Value *DestPtr = Builder.CreateInBoundsGEP(ShadowArrTy, ShadowBuf, {Builder.getInt32(0), Builder.getInt32(Offset)});
+          Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+          Offset += Len;
+        }
+        
+        Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
+        std::vector<Value *> NewArgs;
+        if (FirstArgs.Type == IOArgs::C_FWRITE) {
+          NewArgs = {ShadowBuf, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+        } else {
+          NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal};
+        }
+        Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+        errs() << "[IOOpt] SUCCESS: Shadow Buffered " << Batch.size() << " writes into 1 (" << TotalConstSize << " bytes)!\n";
+        break;
       }
-      
-      Value *Fd = Builder.CreateIntCast(FirstArgs.Target, Int32Ty, false);
-      Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size())});
-      errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " " 
-             << (isRead ? "reads" : "writes") << " to " << FuncName << "!\n";
+
+      case IOPattern::Vectored: {
+        Type *Int32Ty = Builder.getInt32Ty();
+        Type *PtrTy = PointerType::getUnqual(M->getContext());
+        Type *SizeTy = DL.getIntPtrType(M->getContext());
+        
+        StringRef FuncName = isRead ? "readv" : "writev";
+        FunctionType *VecTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
+        FunctionCallee VecFunc = M->getOrInsertFunction(FuncName, VecTy);
+        
+        StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
+        ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
+        
+        Function *F = Batch.back()->getFunction();
+        IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+        AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
+        
+        for (size_t i = 0; i < Batch.size(); ++i) {
+          IOArgs Args = getIOArguments(Batch[i]);
+          Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
+          Builder.CreateStore(Args.Buffer, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
+          Builder.CreateStore(Builder.CreateIntCast(Args.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
+        }
+        
+        Value *Fd = Builder.CreateIntCast(FirstArgs.Target, Int32Ty, false);
+        Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size())});
+        errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " " 
+               << (isRead ? "reads" : "writes") << " to " << FuncName << "!\n";
+        break;
+      }
+
+      case IOPattern::Unprofitable:
+      default:
+        break;
     }
         
+    // Clean up the old unoptimised instructions
     for (CallInst *C : Batch) C->eraseFromParent();
     Batch.clear();
     return true;
   }
-  
+
+ 
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
     if (!Args.Buffer) return false;
@@ -381,7 +433,7 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     IOOptimisationPass() {}
     
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-      errs() << "[IOOpt] Analyzing function: " << F.getName() << "\n";
+      errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
       bool Changed = false;
       
       AAResults &AA = FAM.getResult<AAManager>(F);
