@@ -28,6 +28,11 @@ static cl::opt<unsigned> IOShadowBufferSize(
     "io-shadow-buffer-max", 
     cl::desc("Maximum bytes to allocate on the stack for shadow buffering"), 
     cl::init(4096));
+static cl::opt<unsigned> IOHighWaterMark(
+    "io-high-water-mark", 
+    cl::desc("Maximum cumulative bytes before forcing a pipeline flush (default 64KB)"), 
+    cl::init(65536), // 64 KB
+    cl::Hidden);
 
 namespace {
 
@@ -540,9 +545,11 @@ namespace {
           }
         }
       }
-    
+   
+
       for (BasicBlock &BB : F) {
         std::vector<CallInst*> IOBatch;
+        uint64_t CurrentBatchBytes = 0;
 
         for (Instruction &I : llvm::make_early_inc_range(BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
@@ -551,33 +558,52 @@ namespace {
             bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD);
 
             if (isWrite || isRead) {
+              
+              // Helper to calculate the byte-weight of the current call
+              uint64_t CallBytes = 4096; // Safe default for dynamic sizes
+              if (auto *ConstLen = dyn_cast<ConstantInt>(CArgs.Length)) {
+                  CallBytes = ConstLen->getZExtValue();
+              }
+
+              // Edge Case 1: Return value is used. We can't batch it safely.
               if (!Call->use_empty()) {
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
+                CurrentBatchBytes = 0; // Reset after flush
                 continue;
               }
 
+              // Edge Case 2: Switching between Reads and Writes
               if (!IOBatch.empty()) {
                 IOArgs BatchArgs = getIOArguments(IOBatch.front());
                 bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD);
                 if (BatchIsRead != isRead) {
                    if (flushBatch(IOBatch, F.getParent())) Changed = true;
+                   CurrentBatchBytes = 0; // Reset after flush
                 }
               }
 
+              // Main Logic: Is it safe to batch?
               if (isSafeToAddToBatch(IOBatch, Call, AA, DL)) {
                 IOBatch.push_back(Call);
-                if (IOBatch.size() >= 1024) {
+                CurrentBatchBytes += CallBytes; // Add to our High-Water Tracker
+                
+                if (CurrentBatchBytes >= IOHighWaterMark) {
                   if (flushBatch(IOBatch, F.getParent())) Changed = true;
+                  CurrentBatchBytes = 0; // Reset after flush
                 }
               } else {
+                // Hazard detected. Flush the old batch and start a new one
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
                 IOBatch.push_back(Call);
+                CurrentBatchBytes = CallBytes; // Initialise tracker with this new call
               }
             }
           }
         }
+        // Flush anything left at the end of the Basic Block
         if (flushBatch(IOBatch, F.getParent())) Changed = true;
       }
+ 
 
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
