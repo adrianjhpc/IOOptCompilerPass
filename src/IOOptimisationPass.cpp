@@ -512,18 +512,86 @@ namespace {
   
   struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
     IOOptimisationPass() {}
-    
+
+    // ====================================================================
+    // PHASE 1: LOOP-EXIT (LAZY) FLUSHING
+    // ====================================================================
+    bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
+      // 1. We need a guaranteed exit block to drop our batched write into.
+      BasicBlock *ExitBB = L->getExitBlock();
+      if (!ExitBB) return false;
+
+      // 2. Ask SCEV exactly how many times this loop will run.
+      unsigned TripCount = SE.getSmallConstantTripCount(L);
+      if (TripCount == 0) return false;
+
+      bool LoopChanged = false;
+
+      // 3. Scan the loop for I/O instructions
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+            IOArgs Args = getIOArguments(Call);
+            
+            if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ || 
+                Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+                
+              auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
+              if (!ConstLen) continue; // Can only scale static payload sizes
+
+              // Calculate the total bytes this loop will write/read across all iterations
+              uint64_t ElementSize = ConstLen->getZExtValue();
+              uint64_t TotalBytes = ElementSize * TripCount;
+
+              // High-Water Mark protection for massive loops!
+              if (TotalBytes > IOHighWaterMark) continue;
+
+              // 4. THE TRANSFORMATION: Lazy Loop-Exit Hoisting!
+              IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
+              Value *BasePointer = Args.Buffer; 
+              Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
+              
+              std::vector<Value *> NewArgs;
+              if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+                NewArgs = {Args.Buffer, Call->getArgOperand(1), TotalLenVal, Args.Target};
+              } else {
+                NewArgs = {Args.Target, BasePointer, TotalLenVal};
+              }
+
+              ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
+
+              errs() << "[IOOpt] SUCCESS: Hoisted Loop I/O! Scaled " << ElementSize 
+                     << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
+
+              // 5. Erase the slow I/O call from inside the loop!
+              Call->eraseFromParent();
+              LoopChanged = true;
+            }
+          }
+        }
+      }
+      return LoopChanged;
+    }
+
+    // ====================================================================
+    // MAIN PASS EXECUTION
+    // ====================================================================
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
       bool Changed = false;
-      
+
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
-      
-      for (Loop *L : LI) if (optimiseLoopIO(L, SE, DL)) Changed = true;
-    
+
+      // Phase 1: Hoist I/O out of loops
+      // We use getLoopsInPreorder to ensure we safely process nested loops
+      for (Loop *L : LI.getLoopsInPreorder()) {
+        if (optimiseLoopIO(L, SE, DL)) Changed = true;
+      }
+
+      // Phase 2: Hoist isolated reads to the top of their blocks
       for (BasicBlock &BB : F) {
         for (Instruction &I : llvm::make_early_inc_range(BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
@@ -535,6 +603,7 @@ namespace {
         }
       }
 
+      // Phase 3: Sink isolated writes to the bottom of their blocks
       for (BasicBlock &BB : F) {
         for (Instruction &I : llvm::make_early_inc_range(llvm::reverse(BB))) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
@@ -545,8 +614,8 @@ namespace {
           }
         }
       }
-   
 
+      // Phase 4: Block-level batching (Contiguous, Shadow Buffered, Vectored, Strided)
       for (BasicBlock &BB : F) {
         std::vector<CallInst*> IOBatch;
         uint64_t CurrentBatchBytes = 0;
@@ -558,17 +627,15 @@ namespace {
             bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD);
 
             if (isWrite || isRead) {
-              
-              // Helper to calculate the byte-weight of the current call
               uint64_t CallBytes = 4096; // Safe default for dynamic sizes
               if (auto *ConstLen = dyn_cast<ConstantInt>(CArgs.Length)) {
                   CallBytes = ConstLen->getZExtValue();
               }
 
-              // Edge Case 1: Return value is used. We can't batch it safely.
+              // Edge Case 1: Return value is used
               if (!Call->use_empty()) {
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
-                CurrentBatchBytes = 0; // Reset after flush
+                CurrentBatchBytes = 0;
                 continue;
               }
 
@@ -578,32 +645,31 @@ namespace {
                 bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD);
                 if (BatchIsRead != isRead) {
                    if (flushBatch(IOBatch, F.getParent())) Changed = true;
-                   CurrentBatchBytes = 0; // Reset after flush
+                   CurrentBatchBytes = 0;
                 }
               }
 
               // Main Logic: Is it safe to batch?
               if (isSafeToAddToBatch(IOBatch, Call, AA, DL)) {
                 IOBatch.push_back(Call);
-                CurrentBatchBytes += CallBytes; // Add to our High-Water Tracker
-                
+                CurrentBatchBytes += CallBytes;
+
+                // High-Water Mark Flush!
                 if (CurrentBatchBytes >= IOHighWaterMark) {
                   if (flushBatch(IOBatch, F.getParent())) Changed = true;
-                  CurrentBatchBytes = 0; // Reset after flush
+                  CurrentBatchBytes = 0;
                 }
               } else {
-                // Hazard detected. Flush the old batch and start a new one
+                // Hazard detected.
                 if (flushBatch(IOBatch, F.getParent())) Changed = true;
                 IOBatch.push_back(Call);
-                CurrentBatchBytes = CallBytes; // Initialise tracker with this new call
+                CurrentBatchBytes = CallBytes; 
               }
             }
           }
         }
-        // Flush anything left at the end of the Basic Block
         if (flushBatch(IOBatch, F.getParent())) Changed = true;
       }
- 
 
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
