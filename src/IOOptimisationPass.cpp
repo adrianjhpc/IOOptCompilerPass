@@ -144,7 +144,28 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         }
     }
 
-    if (!AllContiguous && Batch.size() < 4 && !CanShadowBuffer) {
+    size_t DynamicThreshold = 4; // Default to the safe local baseline
+
+    Function *F = Batch.back()->getFunction();
+    if (F->getInstructionCount() > 150) {
+        DynamicThreshold = 3; // Large function = safe to be aggressive
+    }
+
+    uint64_t KnownTotalSize = 0;
+    bool AllSizesConstant = true;
+    for (CallInst *C : Batch) {
+        if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
+            KnownTotalSize += CI->getZExtValue();
+        } else {
+            AllSizesConstant = false;
+        }
+    }
+    
+    if (AllSizesConstant && KnownTotalSize > 128) {
+        DynamicThreshold = 3;
+    }
+
+    if (!AllContiguous && Batch.size() < DynamicThreshold && !CanShadowBuffer) {
         Batch.clear();
         return false;
     }
