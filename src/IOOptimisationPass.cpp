@@ -12,10 +12,8 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
-#include "llvm/IR/Dominators.h"
 
 #include <vector>
-#include <map>
 
 using namespace llvm;
 
@@ -87,12 +85,13 @@ namespace {
     };
 
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
-    BasicBlock *LastBB = LastCall->getParent();
-    BasicBlock *NewBB = NewCall->getParent();
 
-    auto CheckInst = [&](Instruction *I) {
-      if (!I->mayReadOrWriteMemory()) return true;
+    for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
+      if (!I) return false;
+      if (!I->mayReadOrWriteMemory()) continue;
+      
       if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
+      
       for (CallInst *BatchedCall : Batch) {
         IOArgs BArgs = getIOArguments(BatchedCall);
         MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
@@ -101,21 +100,6 @@ namespace {
       if (FirstArgs.Target->getType()->isPointerTy()) {
           MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
           if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
-      }
-      return true;
-    };
-
-    if (LastBB == NewBB) {
-      for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
-        if (!I) return false; 
-        if (!CheckInst(I)) return false;
-      }
-    } else {
-      for (Instruction *I = LastCall->getNextNode(); I != nullptr; I = I->getNextNode()) {
-        if (!CheckInst(I)) return false;
-      }
-      for (Instruction *I = &NewBB->front(); I != NewCall; I = I->getNextNode()) {
-        if (!CheckInst(I)) return false;
       }
     }
     return true;
@@ -154,7 +138,7 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         auto *C2 = dyn_cast<ConstantInt>(getIOArguments(Batch[1]).Length);
         if (C1 && C2) {
             TotalConstSize = C1->getZExtValue() + C2->getZExtValue();
-            if (TotalConstSize > 0 && TotalConstSize <= 4096) { // Max 4KB on stack
+            if (TotalConstSize > 0 && TotalConstSize <= 4096) { 
                 CanShadowBuffer = true;
             }
         }
@@ -242,7 +226,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     Batch.clear();
     return true;
   }
-  
   
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
@@ -332,7 +315,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
       if (CurrentInst->mayThrow()) break;
       
       if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
-        // Prevent perfectly adjacent writes from being pulled apart by scope closures
         if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
             CI->getIntrinsicID() == Intrinsic::lifetime_start) {
             break;
@@ -351,7 +333,6 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
       CurrentInst = CurrentInst->getNextNode();
     }
     
-    // If we found a valid spot further down, sink it!
     if (InsertPoint != WriteCall) {
       WriteCall->moveAfter(InsertPoint);
       return true;
@@ -364,33 +345,11 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       errs() << "[IOOpt] Analyzing function: " << F.getName() << "\n";
-
-
-      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
-      int ioCount = 0;
-      for (BasicBlock &BB : F) {
-        for (Instruction &I : BB) {
-          if (auto *Call = dyn_cast<CallInst>(&I)) {
-            if (getIOArguments(Call).Type != IOArgs::NONE) {
-              ioCount++;
-              if (ioCount >= 2) break; // We only need to know if there are at least 2
-            }
-          }
-        }
-        if (ioCount >= 2) break;
-      }
-
-      // If there are fewer than 2 I/O operations in this entire function, 
-      // batching is impossible. Bail out immediately to preserve the native 
-      // CPU instruction scheduling!
-      if (ioCount < 2 && LI.empty()) {
-        return PreservedAnalyses::all(); 
-      }
-
-      errs() << "[IOOpt] Analyzing function: " << F.getName() << " (Found " << ioCount << "+ I/O ops)\n";
       bool Changed = false;
+      
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
+      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
       
       for (Loop *L : LI) if (optimiseLoopIO(L, SE, DL)) Changed = true;
@@ -417,21 +376,10 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
         }
       }
     
-      DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-      std::map<BasicBlock*, std::vector<CallInst*>> LiveBatches;
-
-      // We use a recursive lambda to traverse the tree Top-Down
-      std::function<void(DomTreeNode*)> traverseDomTree = [&](DomTreeNode *Node) {
-        BasicBlock *BB = Node->getBlock();
+      for (BasicBlock &BB : F) {
         std::vector<CallInst*> IOBatch;
 
-        BasicBlock *Pred = BB->getSinglePredecessor();
-        if (Pred && LiveBatches.count(Pred)) {
-            IOBatch = std::move(LiveBatches[Pred]);
-            LiveBatches.erase(Pred);
-        }
-
-        for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+        for (Instruction &I : llvm::make_early_inc_range(BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs CArgs = getIOArguments(Call);
             bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE);
@@ -463,20 +411,8 @@ bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
             }
           }
         }
-
-        BasicBlock *Succ = BB->getSingleSuccessor();
-        if (Succ && Succ->getSinglePredecessor() == BB) {
-            LiveBatches[BB] = std::move(IOBatch);
-        } else {
-            if (flushBatch(IOBatch, F.getParent())) Changed = true;
-        }
-
-        for (auto *Child : *Node) {
-            traverseDomTree(Child);
-        }
-      };
-
-      traverseDomTree(DT.getRootNode());
+        if (flushBatch(IOBatch, F.getParent())) Changed = true;
+      }
 
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
