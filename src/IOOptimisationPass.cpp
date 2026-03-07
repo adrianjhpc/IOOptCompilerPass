@@ -76,36 +76,42 @@ namespace {
     return false;
   }
 
- bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
+
+  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
     if (Batch.empty()) return true;
-    
+
     CallInst *LastCall = Batch.back();
     if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) return false;
-    
+
     IOArgs FirstArgs = getIOArguments(Batch.front());
     IOArgs NewArgs = getIOArguments(NewCall);
-    
+
+    // 1. Target Matching Logic
     bool TargetsMatch = (FirstArgs.Target == NewArgs.Target);
+    LoadInst *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
+    LoadInst *Load2 = dyn_cast<LoadInst>(NewArgs.Target);
+    
     if (!TargetsMatch) {
-      auto *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
-      auto *Load2 = dyn_cast<LoadInst>(NewArgs.Target);
       if (Load1 && Load2 && Load1->getPointerOperand() == Load2->getPointerOperand()) {
         TargetsMatch = true;
       }
     }
     if (!TargetsMatch) return false;
 
+    // Helper for precise sizes
     auto getPreciseLoc = [&](Value *Buf, Value *Len) {
       if (auto *C = dyn_cast<ConstantInt>(Len))
         return MemoryLocation(Buf, LocationSize::precise(C->getZExtValue()));
-      return MemoryLocation::getBeforeOrAfter(Buf);
+      return MemoryLocation(Buf, LocationSize::beforeOrAfterPointer());
     };
 
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
 
+    // 2. The Hazard Scanning Loop
     for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
       if (!I) return false;
 
+      // Opaque Barriers and Lifetimes
       if (auto *CI = dyn_cast<CallInst>(I)) {
           if (CI->getIntrinsicID() == Intrinsic::lifetime_end ||
               CI->getIntrinsicID() == Intrinsic::lifetime_start) {
@@ -113,27 +119,39 @@ namespace {
           }
           if (getIOArguments(CI).Type != IOArgs::NONE) return false;
 
+          // If it's an opaque function that might write memory, ABORT!
           if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
       }
 
       if (!I->mayReadOrWriteMemory()) continue;
 
+      // Hazard Check A: Is the new buffer mutated?
       if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
 
+      // Hazard Check B: Are any already batched buffers mutated?
       for (CallInst *BatchedCall : Batch) {
         IOArgs BArgs = getIOArguments(BatchedCall);
         MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
         if (isModSet(AA.getModRefInfo(I, BLoc))) return false;
       }
+
+      // Hazard Check C: Is the File Descriptor / FILE* mutated?
+      // Check if the Target itself is a pointer (e.g., FILE*)
       if (FirstArgs.Target->getType()->isPointerTy()) {
           MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
           if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
       }
+      
+      // CRITICAL FIX: If the target is an integer loaded from memory (e.g., int fd),
+      // we MUST ensure the memory holding that integer wasn't overwritten!
+      if (Load1) {
+          MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::beforeOrAfterPointer());
+          if (isModSet(AA.getModRefInfo(I, FdLoc))) return false;
+      }
     }
-    
-    return true;
-  } 
 
+    return true;
+}
 
 // ====================================================================
   // 1. Define the I/O Patterns
