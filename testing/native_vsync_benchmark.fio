@@ -1,0 +1,14 @@
+[global]
+# THE CONTROL: Native OS scatter-gather I/O (readv/writev)
+ioengine=vsync
+direct=1          # O_DIRECT bypasses the OS page cache
+bs=4k             # 4KB block size
+size=2G           # 2 Gigabytes per thread
+rw=read       # Random reads
+numjobs=4         # 4 parallel threads
+group_reporting=1 # Aggregate the results
+time_based=1      # Run for a fixed amount of time
+runtime=30        # 30 seconds
+
+[vsync_test]
+filename=/tmp/fio_test_data.bin

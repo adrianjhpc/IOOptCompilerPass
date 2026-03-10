@@ -1,0 +1,14 @@
+[global]
+# We use psync to test our explicit-offset pread/pwrite optimization!
+ioengine=psync
+direct=1          # O_DIRECT bypasses the OS page cache (pure NVMe/syscall latency)
+bs=4k             # 4KB block size (forces massive amounts of system calls)
+size=2G           # 2 Gigabytes per thread
+rw=read       # Random reads (to test offset tracking)
+numjobs=4         # 4 parallel threads
+group_reporting=1 # Aggregate the results
+time_based=1      # Run for a fixed amount of time
+runtime=30        # 30 seconds
+
+[ioopt_test]
+filename=/tmp/fio_test_data.bin
