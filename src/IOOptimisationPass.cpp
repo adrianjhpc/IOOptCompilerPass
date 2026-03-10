@@ -401,11 +401,6 @@ namespace {
     }
     if (StrictPhysical) return IOPattern::Contiguous;
 
-    // We do not currently have Vectored, Strided, or ShadowBuffer IR generators for MPI.
-    if (FirstArgs.Type == IOArgs::MPI_READ_AT || FirstArgs.Type == IOArgs::MPI_WRITE_AT) {
-      return IOPattern::Unprofitable;
-    }
-
     // Strided Pattern
     if (isStridedPattern(Batch, DL, SE)) {
       // Grab the length of the first call's buffer
@@ -443,13 +438,16 @@ namespace {
     }
 
     if (Batch.size() >= DynamicThreshold) {
-      return IOPattern::Vectored;
+      if (FirstArgs.Type != IOArgs::MPI_READ_AT && FirstArgs.Type != IOArgs::MPI_WRITE_AT) {
+        return IOPattern::Vectored;
+      }
     }
 
     // Shadow buffer (fallback for small writes that missed the Vectored threshold)
     if (FirstArgs.Type == IOArgs::POSIX_WRITE || 
         FirstArgs.Type == IOArgs::C_FWRITE || 
-        FirstArgs.Type == IOArgs::CXX_WRITE) {
+        FirstArgs.Type == IOArgs::CXX_WRITE ||
+        FirstArgs.Type == IOArgs::MPI_WRITE_AT) { 
         
       uint64_t TotalConstSize = 0;
       bool AllSizesConstant = true;
