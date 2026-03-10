@@ -60,18 +60,8 @@ namespace {
     if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FREAD};
 
     // Signature: (fh, offset, buf, count, datatype, status)
-    if (Demangled.find("MPI_File_write_at") != std::string::npos || 
-    Demangled.find("PMPI_File_write_at") != std::string::npos ||
-    Demangled.find("ADIOI_") != std::string::npos) { // Catch internal ADIO calls
-    
-      return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
-    }
-
-    if (Demangled.find("MPI_File_read_at") != std::string::npos || 
-    Demangled.find("PMPI_File_read_at") != std::string::npos) {
-    
-    return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_READ_AT};
-}
+    if (Demangled == "MPI_File_write_at" || Demangled == "PMPI_File_write_at") return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
+    if (Demangled == "MPI_File_read_at" || Demangled == "PMPI_File_read_at")  return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_READ_AT};
 
     // C++ Streams
     if ((Demangled.find("std::basic_ostream") != std::string::npos || 
@@ -82,79 +72,114 @@ namespace {
     return {nullptr, nullptr, nullptr, IOArgs::NONE};
   }
 
-  bool checkAdjacency(Value *BufA, Value *LenA, Value *BufB, const DataLayout &DL, ScalarEvolution *SE = nullptr) {
+
+  bool checkAdjacency(Value *Buf1, Value *Len1, Value *Buf2, const DataLayout &DL, ScalarEvolution *SE, bool AllowGaps = false) {
     if (SE) {
-      const SCEV *A = SE->getSCEV(BufA);
-      const SCEV *Len = SE->getSCEV(LenA);
-      const SCEV *B = SE->getSCEV(BufB);
+      const SCEV *Ptr1 = SE->getSCEV(Buf1);
+      const SCEV *Ptr2 = SE->getSCEV(Buf2);
+      const SCEV *Size1 = SE->getSCEV(Len1);
 
-      if (!isa<SCEVCouldNotCompute>(A) && !isa<SCEVCouldNotCompute>(B) && !isa<SCEVCouldNotCompute>(Len)) {
-	// Handle bit-width differences (i32 vs i64)
-	// We extend the length to match the pointer/offset width to avoid APInt crashes
-	const SCEV *ExtendedLen = SE->getTruncateOrZeroExtend(Len, A->getType());
-	const SCEV *ExpectedB = SE->getAddExpr(A, ExtendedLen);
-	if (ExpectedB == B) return true;
-      }
-    }
+      if (!isa<SCEVCouldNotCompute>(Ptr1) && !isa<SCEVCouldNotCompute>(Ptr2) && !isa<SCEVCouldNotCompute>(Size1)) {
+	const SCEV *ExtendedSize = SE->getTruncateOrZeroExtend(Size1, Ptr1->getType());
+	const SCEV *ExpectedNext = SE->getAddExpr(Ptr1, ExtendedSize);
 
-    // Fallback: Pointer-base striping (Handles simple C-style array math)
-    auto *BaseA = BufA->stripPointerCasts();
-    auto *BaseB = BufB->stripPointerCasts();
-    if (auto *GEP = dyn_cast<GEPOperator>(BaseB)) {
-      if (GEP->getPointerOperand() == BaseA) {
-	APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
-	if (GEP->accumulateConstantOffset(DL, Offset)) {
-	  if (auto *LenConst = dyn_cast<ConstantInt>(LenA)) {
-	    // Use getZExtValue to safely compare across different bit widths
-	    return Offset.getZExtValue() == LenConst->getZExtValue();
+	if (ExpectedNext == Ptr2) return true; 
+
+	// Only allow gaps if the caller explicitly asks (ShadowBuffer path)
+	if (AllowGaps) {
+	  const SCEV *Distance = SE->getMinusSCEV(Ptr2, ExpectedNext);
+	  if (auto *ConstDist = dyn_cast<SCEVConstant>(Distance)) {
+	    int64_t Gap = ConstDist->getValue()->getSExtValue();
+	    if (Gap >= 0 && Gap < 1024) return true;
 	  }
 	}
       }
     }
+
+    // Fallback logic
+    APInt Off1(DL.getIndexTypeSizeInBits(Buf1->getType()), 0);
+    const Value *Base1 = Buf1->stripAndAccumulateConstantOffsets(DL, Off1, true);
+    APInt Off2(DL.getIndexTypeSizeInBits(Buf2->getType()), 0);
+    const Value *Base2 = Buf2->stripAndAccumulateConstantOffsets(DL, Off2, true);
+
+    if (Base1 && Base1 == Base2) {
+      if (auto *CLen = dyn_cast<ConstantInt>(Len1)) {
+	uint64_t End1 = Off1.getZExtValue() + CLen->getZExtValue();
+	uint64_t Start2 = Off2.getZExtValue();
+	if (End1 == Start2) return true;
+	if (AllowGaps && Start2 > End1 && (Start2 - End1) < 1024) return true;
+      }
+    }
+
     return false;
   }
 
   bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE) {
+    errs() << "[IOOpt-Debug] Attempting to add " << *NewCall << " to batch of size " << Batch.size() << "\n";
     if (Batch.empty()) return true;
 
     CallInst *LastCall = Batch.back();
-    if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) return false;
+
+    if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) {
+      errs() << "[IOOpt-Debug] Batch Break: Function mismatch.\n";
+      return false;
+    }
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
     IOArgs LastArgs = getIOArguments(LastCall);
     IOArgs NewArgs = getIOArguments(NewCall);
 
-    // Disk Offset Contiguity Tracking ---
+    if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) {
+      errs() << "[IOOpt-Debug] Batch Break: Function mismatch.\n";
+      return false;
+    }
+ 
+    // C++ ostream::write returns 'this' (the stream pointer).
+    // If NewCall's first argument is the result of LastCall, it's a "chain," not a hazard.
+    bool IsCXXChain = false;
+    if (NewArgs.Type == IOArgs::CXX_WRITE) {
+      if (NewCall->getArgOperand(0) == LastCall) {
+	IsCXXChain = true;
+      }
+    }
+
     if (NewArgs.Type == IOArgs::POSIX_PREAD || NewArgs.Type == IOArgs::POSIX_PWRITE) {
       Value *LastOffset = LastCall->getArgOperand(3);
       Value *NewOffset = NewCall->getArgOperand(3);
       Value *LastLen = LastArgs.Length;
       bool isContiguous = false;
-        
+    
       if (SE.isSCEVable(LastOffset->getType()) && SE.isSCEVable(NewOffset->getType()) && SE.isSCEVable(LastLen->getType())) {
-	const SCEV *SLast = SE.getSCEV(LastOffset);
-	const SCEV *SNew = SE.getSCEV(NewOffset);
-	const SCEV *SLen = SE.getSCEV(LastLen);
-	if (!isa<SCEVCouldNotCompute>(SLast) && !isa<SCEVCouldNotCompute>(SNew) && !isa<SCEVCouldNotCompute>(SLen)) {
-	  if (SLast->getType() == SLen->getType()) {
-	    const SCEV *ExpectedNext = SE.getAddExpr(SLast, SLen);
-	    if (ExpectedNext == SNew) isContiguous = true;
+        const SCEV *SLast = SE.getSCEV(LastOffset);
+        const SCEV *SNew = SE.getSCEV(NewOffset);
+        const SCEV *SLen = SE.getSCEV(LastLen);
+        if (!isa<SCEVCouldNotCompute>(SLast) && !isa<SCEVCouldNotCompute>(SNew) && !isa<SCEVCouldNotCompute>(SLen)) {
+	  // Must be contiguous on disk for pwrite/pread
+	  const SCEV *ExpectedNext = SE.getAddExpr(SLast, SE.getTruncateOrZeroExtend(SLen, SLast->getType()));
+	  if (ExpectedNext == SNew) {
+	    isContiguous = true;
 	  }
-	}
+        }
       }
+    
+      // Fallback: raw Constants
       if (!isContiguous) {
-	if (auto *CLastOff = dyn_cast<ConstantInt>(LastOffset)) {
+        if (auto *CLastOff = dyn_cast<ConstantInt>(LastOffset)) {
 	  if (auto *CNewOff = dyn_cast<ConstantInt>(NewOffset)) {
 	    if (auto *CLen = dyn_cast<ConstantInt>(LastLen)) {
-	      if (CLastOff->getZExtValue() + CLen->getZExtValue() == CNewOff->getZExtValue()) isContiguous = true;
+	      if (CLastOff->getZExtValue() + CLen->getZExtValue() == CNewOff->getZExtValue()) {
+		isContiguous = true;
+	      }
 	    }
 	  }
-	}
+        }
       }
+    
+      // Do not allow gaps for explicit offsets
       if (!isContiguous) return false;
 
     } else if (NewArgs.Type == IOArgs::MPI_READ_AT || NewArgs.Type == IOArgs::MPI_WRITE_AT) {
-      // MPI Smart Datatype Checking (Resolves OpenMPI opaque pointer loads)
+      // MPI Smart Datatype Checking (resolve opaque pointer loads)
       Value *DT1 = LastCall->getArgOperand(4);
       Value *DT2 = NewCall->getArgOperand(4);
       if (DT1 != DT2) {
@@ -167,42 +192,58 @@ namespace {
 
       Value *LastOffset = LastCall->getArgOperand(1);
       Value *NewOffset = NewCall->getArgOperand(1);
-      Value *LastCount = LastArgs.Length; 
-        
+      Value *LastCount = LastArgs.Length;
       bool isContiguous = false;
-      if (SE.isSCEVable(LastOffset->getType()) && SE.isSCEVable(NewOffset->getType()) && SE.isSCEVable(LastCount->getType())) {
-	const SCEV *SLast = SE.getSCEV(LastOffset);
-	const SCEV *SNew = SE.getSCEV(NewOffset);
-	const SCEV *SCount = SE.getSCEV(LastCount);
-	if (!isa<SCEVCouldNotCompute>(SLast) && !isa<SCEVCouldNotCompute>(SNew) && !isa<SCEVCouldNotCompute>(SCount)) {
-	  // Safely extend the count to match the offset bit-width
-	  const SCEV *ExtendedCount = SCount;
-	  if (SCount->getType()->getIntegerBitWidth() < SLast->getType()->getIntegerBitWidth()) {
-	    ExtendedCount = SE.getZeroExtendExpr(SCount, SLast->getType());
-	  }
-	  const SCEV *ExpectedNext = SE.getAddExpr(SLast, ExtendedCount);
-	  if (ExpectedNext == SNew) isContiguous = true;
-	} 
-      }
-        
-      // Fallback: If SCEV fails, see if they are raw Constants we can add manually
-      if (!isContiguous) {
-	if (auto *CLastOff = dyn_cast<ConstantInt>(LastOffset)) {
-	  if (auto *CNewOff = dyn_cast<ConstantInt>(NewOffset)) {
-	    if (auto *CLen = dyn_cast<ConstantInt>(LastCount)) {
-	      if (CLastOff->getZExtValue() + CLen->getZExtValue() == CNewOff->getZExtValue()) {
-		isContiguous = true;
-	      }
+
+      if (SE.isSCEVable(LastOffset->getType()) && SE.isSCEVable(NewOffset->getType())) {
+        const SCEV *SLast = SE.getSCEV(LastOffset);
+        const SCEV *SNew = SE.getSCEV(NewOffset);
+        const SCEV *SCount = SE.getTruncateOrZeroExtend(SE.getSCEV(LastCount), SLast->getType());
+
+        if (!isa<SCEVCouldNotCompute>(SLast) && !isa<SCEVCouldNotCompute>(SNew)) {
+	  const SCEV *ExpectedNext = SE.getAddExpr(SLast, SCount);
+	  if (ExpectedNext == SNew) {
+	    isContiguous = true;
+	  } else {
+	    // Gap Tolerance: Allow small jumps (e.g., < 1024 bytes) for Shadow Buffering
+	    const SCEV *GapSCEV = SE.getMinusSCEV(SNew, ExpectedNext);
+	    if (auto *ConstGap = dyn_cast<SCEVConstant>(GapSCEV)) {
+	      int64_t GapVal = ConstGap->getValue()->getSExtValue();
+	      if (GapVal > 0 && GapVal < 1024) isContiguous = true;
 	    }
 	  }
-	}
+        }
+      }
+
+      // Fallback for raw constants
+      if (!isContiguous) {
+        if (auto *CLastOff = dyn_cast<ConstantInt>(LastOffset)) {
+	  if (auto *CNewOff = dyn_cast<ConstantInt>(NewOffset)) {
+	    if (auto *CLen = dyn_cast<ConstantInt>(LastCount)) {
+	      uint64_t Gap = CNewOff->getZExtValue() - (CLastOff->getZExtValue() + CLen->getZExtValue());
+	      if (Gap < 1024) isContiguous = true;
+	    }
+	  }
+        }
       }
 
       if (!isContiguous) return false;
 
     } else if (NewArgs.Type == IOArgs::POSIX_READ || NewArgs.Type == IOArgs::POSIX_WRITE) {
-      // Implicit offsets natively guarantee contiguity if File Descriptors match
-      if (NewArgs.Target != LastArgs.Target) return false; 
+      // Implicit offsets natively guarantee disk contiguity if File Descriptors match.
+      // We check the Target (the FD) for equality.
+      bool FDsMatch = (NewArgs.Target == LastArgs.Target);
+    
+      // Smart FD resolution: check if they load from the same memory location
+      if (!FDsMatch) {
+        auto *L1 = dyn_cast<LoadInst>(LastArgs.Target);
+        auto *L2 = dyn_cast<LoadInst>(NewArgs.Target);
+        if (L1 && L2 && L1->getPointerOperand() == L2->getPointerOperand()) {
+	  FDsMatch = true;
+        }
+      }
+
+      if (!FDsMatch) return false; 
     }
 
     // Target Matching Logic
@@ -226,68 +267,49 @@ namespace {
 
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
 
-    Instruction *I = LastCall->getNextNode();
+    // Hazard Scanning Loop (Cross-Block Support)
+    Instruction *CurrInst = LastCall->getNextNode();
     BasicBlock *CurrBB = LastCall->getParent();
 
-    while (I != NewCall) {
-      // If we hit the end of a Basic Block, move to the successor
-      if (!I) {
-	Instruction *Term = CurrBB->getTerminator();         
-   
-	// Safety: We only follow "Success" paths. If there are multiple 
-	// successors (like a switch), or if it's a return, we must abort.
-	BasicBlock *NextBB = nullptr;
-	if (auto *BI = dyn_cast<BranchInst>(Term)) {
-	  if (BI->isConditional()) {
-	    // Follow the path that DOES NOT return (the success path)
-	    for (BasicBlock *Succ : BI->successors()) {
-	      if (!isa<ReturnInst>(Succ->getTerminator())) {
-		NextBB = Succ;
-		break;
-	      }
-	    }
-	  } else {
-	    NextBB = BI->getSuccessor(0);
-	  }
-	}
-
-	// Only proceed if the path is linear (Single Predecessor)
-	if (!NextBB || NextBB->getSinglePredecessor() != CurrBB) return false;
-
-	CurrBB = NextBB;
-	I = &CurrBB->front();
-	continue; 
+    while (CurrInst != NewCall) {
+      if (!CurrInst) {
+	// If we hit the end of the block, move to the next sequential block
+	CurrBB = CurrBB->getNextNode();
+	if (!CurrBB) return false; // Reached end of function safely
+	CurrInst = &CurrBB->front();
+	continue;
       }
 
-      // --- Existing Analysis Logic (Keep this part) ---
-      if (auto *CI = dyn_cast<CallInst>(I)) {
-	if (CI->getIntrinsicID() == Intrinsic::lifetime_end ||
-	    CI->getIntrinsicID() == Intrinsic::lifetime_start) return false;
-            
+      // Opaque Barriers and Lifetimes
+      if (auto *CI = dyn_cast<CallInst>(CurrInst)) {
+	if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
+	    CI->getIntrinsicID() == Intrinsic::lifetime_start) {
+	  return false;
+	}
 	if (getIOArguments(CI).Type != IOArgs::NONE) return false;
 	if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
       }
 
-      if (I->mayReadOrWriteMemory()) {
-	// Check if this instruction mutates the new buffer
-	if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
+      if (CurrInst->mayReadOrWriteMemory()) {
+	if (isModSet(AA.getModRefInfo(CurrInst, NewLoc))) return false;
 
-	// Check if this instruction mutates any previously batched buffers
 	for (CallInst *BatchedCall : Batch) {
 	  IOArgs BArgs = getIOArguments(BatchedCall);
 	  MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-	  if (isModSet(AA.getModRefInfo(I, BLoc))) return false;
+	  if (isModSet(AA.getModRefInfo(CurrInst, BLoc))) return false;
 	}
 
-	// Check for File Descriptor / Target mutations
 	if (FirstArgs.Target->getType()->isPointerTy()) {
 	  MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
-	  if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
+	  if (isModSet(AA.getModRefInfo(CurrInst, TargetLoc))) return false;
+	}
+          
+	if (Load1) {
+	  MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::beforeOrAfterPointer());
+	  if (isModSet(AA.getModRefInfo(CurrInst, FdLoc))) return false;
 	}
       }
-      // --- End of Analysis Logic ---
-
-      I = I->getNextNode();
+      CurrInst = CurrInst->getNextNode();
     }
 
     return true;
@@ -304,103 +326,155 @@ namespace {
     Unprofitable  // Too few calls or lacks byte-weight. Do not optimise
   };
 
+  // --- Helper 1: Detects fixed-distance strides (Struct arrays/MPI Columnar) ---
+  bool isStridedPattern(const std::vector<CallInst*> &Batch, const DataLayout &DL, ScalarEvolution *SE) {
+    if (!SE || Batch.size() < 2) return false;
+
+    // We need to compare the distance between the buffers of each call
+    const SCEV *Ptr0 = SE->getSCEV(getIOArguments(Batch[0]).Buffer);
+    const SCEV *Ptr1 = SE->getSCEV(getIOArguments(Batch[1]).Buffer);
+    const SCEV *Stride = SE->getMinusSCEV(Ptr1, Ptr0);
+
+    // If the stride is 0 or couldn't be computed, it's not a valid stride
+    if (isa<SCEVCouldNotCompute>(Stride) || Stride->isZero()) return false;
+
+    for (size_t i = 1; i < Batch.size() - 1; ++i) {
+      const SCEV *CurrentPtr = SE->getSCEV(getIOArguments(Batch[i]).Buffer);
+      const SCEV *NextPtr = SE->getSCEV(getIOArguments(Batch[i+1]).Buffer);
+      if (SE->getMinusSCEV(NextPtr, CurrentPtr) != Stride) return false;
+    }
+    return true;
+  }
+
+  // --- Helper 2: Calculates the absolute byte-span for Shadow Buffering ---
+  bool calculateTotalRange(const std::vector<CallInst*> &Batch, ScalarEvolution *SE, 
+			   uint64_t &MinOff, uint64_t &MaxOff) {
+    if (!SE || Batch.empty()) return false;
+
+    bool First = true;
+    for (CallInst *CI : Batch) {
+      IOArgs Args = getIOArguments(CI);
+      // For pwrite/pread, the offset is operand 3. For MPI_Write_at, it's operand 1.
+      Value *OffVal = (Args.Type == IOArgs::POSIX_PREAD || Args.Type == IOArgs::POSIX_PWRITE) 
+	? CI->getArgOperand(3) : CI->getArgOperand(1);
+        
+      const SCEV *S_Off = SE->getSCEV(OffVal);
+      const SCEV *S_Len = SE->getTruncateOrZeroExtend(SE->getSCEV(Args.Length), S_Off->getType());
+        
+      auto *C_Off = dyn_cast<SCEVConstant>(S_Off);
+      auto *C_Len = dyn_cast<SCEVConstant>(S_Len);
+
+      if (!C_Off || !C_Len) return false; 
+
+      uint64_t Start = C_Off->getValue()->getZExtValue();
+      uint64_t End = Start + C_Len->getValue()->getZExtValue();
+
+      if (First) {
+	MinOff = Start; MaxOff = End;
+	First = false;
+      } else {
+	MinOff = std::min(MinOff, Start);
+	MaxOff = std::max(MaxOff, End);
+      }
+    }
+    return true;
+  }
+
   // ====================================================================
   // Classifier: Analyes the batch and decides the best strategy
   // ====================================================================
-  IOPattern classifyBatch(const std::vector<CallInst*> &Batch, const DataLayout &DL, uint64_t &OutTotalConstSize, ScalarEvolution *SE = nullptr) {
-    if (Batch.size() <= 1) return IOPattern::Unprofitable;
+  IOPattern classifyBatch(const std::vector<CallInst*> &Batch, const DataLayout &DL, 
+			  uint64_t &OutTotalRange, ScalarEvolution *SE) {
+    if (Batch.size() < 2) return IOPattern::Unprofitable;
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
     bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD || FirstArgs.Type == IOArgs::POSIX_PREAD);
 
-    bool AllContiguous = true;
+    // Physically contiguous
+    bool StrictPhysical = true;
     for (size_t i = 0; i < Batch.size() - 1; ++i) {
-      IOArgs A = getIOArguments(Batch[i]);
-      IOArgs B = getIOArguments(Batch[i+1]);
-      if (!checkAdjacency(A.Buffer, A.Length, B.Buffer, DL, SE)) {
-        AllContiguous = false;
-        break;
+      if (!checkAdjacency(getIOArguments(Batch[i]).Buffer, getIOArguments(Batch[i]).Length, 
+			  getIOArguments(Batch[i+1]).Buffer, DL, SE, false)) {
+	StrictPhysical = false;
+	break;
       }
     }
-    if (AllContiguous) return IOPattern::Contiguous;
+    if (StrictPhysical) return IOPattern::Contiguous;
 
-    // --- SCATTERED I/O ROUTING ---
-    // If we reach here, the batch has memory or disk gaps.
-
-    // We do not currently have Vectored or ShadowBuffer code generators for MPI-IO.
-    // If MPI calls are not perfectly contiguous, we must safely bail out
+    // We do not currently have Vectored, Strided, or ShadowBuffer IR generators for MPI.
     if (FirstArgs.Type == IOArgs::MPI_READ_AT || FirstArgs.Type == IOArgs::MPI_WRITE_AT) {
       return IOPattern::Unprofitable;
     }
 
-    // If it has gaps, it muar be raw POSIX to use writev/preadv.
-    // (This safely rejects C-Library fwrite and C++ streams, which don't support writev)
-    if (FirstArgs.Type != IOArgs::POSIX_WRITE && FirstArgs.Type != IOArgs::POSIX_READ &&
-        FirstArgs.Type != IOArgs::POSIX_PWRITE && FirstArgs.Type != IOArgs::POSIX_PREAD) {
-      return IOPattern::Unprofitable;
-    }
-
-    bool isStrided = false;
-    uint64_t UniformSize = 0;
-    
-    if (!isRead && Batch.size() > 1) {
-      if (auto *FirstSizeC = dyn_cast<ConstantInt>(getIOArguments(Batch.front()).Length)) {
-	UniformSize = FirstSizeC->getZExtValue();
-	if (UniformSize == 1 || UniformSize == 2 || UniformSize == 4 || UniformSize == 8) {
-	  isStrided = true;
-	  for (CallInst *C : Batch) {
-	    auto *SizeC = dyn_cast<ConstantInt>(getIOArguments(C).Length);
-	    if (!SizeC || SizeC->getZExtValue() != UniformSize) {
-	      isStrided = false;
-	      break;
-	    }
-	  }
-	}
-      }
-    }
-
-    if (isStrided) {
-      OutTotalConstSize = UniformSize; 
-      if (Batch.size() >= 4 && Batch.size() <= 64) {
+    // Strided Pattern
+    if (isStridedPattern(Batch, DL, SE)) {
+      // Grab the length of the first call's buffer
+      if (auto *ConstLen = dyn_cast<ConstantInt>(getIOArguments(Batch.front()).Length)) {
+	OutTotalRange = ConstLen->getZExtValue();
 	return IOPattern::Strided;
       }
     }
 
-    size_t DynamicThreshold = IOBatchThreshold; 
-    uint64_t TotalConstSize = 0;
-    bool AllSizesConstant = true;
-
-    for (CallInst *C : Batch) {
-      if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
-        TotalConstSize += CI->getZExtValue();
-      } else {
-        AllSizesConstant = false;
-      }
-    }
+    // Vectored I/O
+    size_t DynamicThreshold = IOBatchThreshold; // Defaults to 4
     
-    OutTotalConstSize = TotalConstSize;
-
     if (isRead) {
       DynamicThreshold = 2; 
     } else {
       Function *F = Batch.back()->getFunction();
-      if (F->getInstructionCount() > 150) DynamicThreshold = 3;
-      if (AllSizesConstant && TotalConstSize > 128) DynamicThreshold = 3;
+      if (F->getInstructionCount() > 150) {
+	DynamicThreshold = 3;
+      } else {
+	// Check if we have constant sizes that add up to > 128 bytes
+	uint64_t TotalBytes = 0;
+	bool AllConstant = true;
+	for (CallInst *C : Batch) {
+	  if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
+	    TotalBytes += CI->getZExtValue();
+	  } else {
+	    AllConstant = false;
+	    break;
+	  }
+	}
+	if (AllConstant && TotalBytes > 128) {
+	  DynamicThreshold = 3;
+	}
+      }
     }
 
     if (Batch.size() >= DynamicThreshold) {
       return IOPattern::Vectored;
     }
 
-    if (!isRead && AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= IOShadowBufferSize) {
-      return IOPattern::ShadowBuffer;
+    // Shadow buffer (fallback for small writes that missed the Vectored threshold)
+    if (FirstArgs.Type == IOArgs::POSIX_WRITE || 
+        FirstArgs.Type == IOArgs::C_FWRITE || 
+        FirstArgs.Type == IOArgs::CXX_WRITE) {
+        
+      uint64_t TotalConstSize = 0;
+      bool AllSizesConstant = true;
+        
+      for (CallInst *C : Batch) {
+	if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
+	  TotalConstSize += CI->getZExtValue();
+	} else {
+	  AllSizesConstant = false;
+	  break;
+	}
+      }
+        
+      // If all sizes are known and fit comfortably on the stack
+      if (AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= IOShadowBufferSize) {
+	OutTotalRange = TotalConstSize;
+	return IOPattern::ShadowBuffer;
+      }
     }
 
     return IOPattern::Unprofitable;
   }
 
   // ====================================================================
-  // 3. The Router: Executes the IR transformations based on the Classifier
+  // The Router: Executes the IR transformations based on the Classifier
   // ====================================================================
   bool flushBatch(std::vector<CallInst*> &Batch, Module *M, ScalarEvolution &SE) {
     if (Batch.empty()) return false;
@@ -420,24 +494,19 @@ namespace {
     bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD || FirstArgs.Type == IOArgs::POSIX_PREAD);
     bool isExplicit = (FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::POSIX_PWRITE);
 
+    // This will hold our new optimized I/O instruction
+    CallInst *MergedCall = nullptr;
+
     switch (Pattern) {
     case IOPattern::Contiguous: {
       Value *TotalLen = FirstArgs.Length;
       for (size_t i = 1; i < Batch.size(); ++i) {
 	TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
       }
-          
+              
       std::vector<Value *> NewArgs;
       if (FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::MPI_READ_AT) {
-	// MPI Signature Reconstruction
-	NewArgs = {
-	  Batch[0]->getArgOperand(0), // fh
-	  Batch[0]->getArgOperand(1), // offset
-	  FirstArgs.Buffer,           // starting buf
-	  TotalLen,                   // summed count
-	  Batch[0]->getArgOperand(4), // datatype
-	  Batch[0]->getArgOperand(5)  // status
-	};
+	NewArgs = { Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), FirstArgs.Buffer, TotalLen, Batch[0]->getArgOperand(4), Batch[0]->getArgOperand(5) };
       } else if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
 	NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
       } else if (isExplicit) {
@@ -445,110 +514,124 @@ namespace {
       } else {
 	NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen};
       }
-      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-
-      // Some applications expects each individual call to return the bytes written.
-      // We loop through the batch and replace the old return values with constants.
-      for (CallInst *C : Batch) {
-	if (!C->use_empty()) {
-	  // If the original code was checking 'if (bytes_written == expected)'
-	  // we give it the 'expected' value so the check passes.
-	  IOArgs OriginalArgs = getIOArguments(C);
-	  C->replaceAllUsesWith(OriginalArgs.Length);
-	}
-      }
-
+      MergedCall = Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
       errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
       break;
     }
 
     case IOPattern::Strided: {
-      unsigned ElementBytes = TotalConstSize;
+      // Validate Size (Prevent i0)
+      unsigned ElementBytes = TotalConstSize; 
+      if (ElementBytes == 0) {
+        errs() << "[IOOpt-Error] Strided element size is 0! Aborting.\n";
+        return false;
+      }
+    
       unsigned NumElements = Batch.size();
-        
       Type *ElementTy = Builder.getIntNTy(ElementBytes * 8); 
       auto *VecTy = FixedVectorType::get(ElementTy, NumElements);
+    
+      // Build the Gather Vector
       Value *GatherVec = PoisonValue::get(VecTy);
-        
       for (unsigned i = 0; i < NumElements; ++i) {
-	IOArgs Args = getIOArguments(Batch[i]);
-	LoadInst *LoadedVal = Builder.CreateLoad(ElementTy, Args.Buffer, "strided.load");
-	GatherVec = Builder.CreateInsertElement(GatherVec, LoadedVal, Builder.getInt32(i), "gather.insert");
+        IOArgs Args = getIOArguments(Batch[i]);
+        // Ensure we load from the buffer with the correct type
+        LoadInst *LoadedVal = Builder.CreateLoad(ElementTy, Args.Buffer, "strided.load");
+        GatherVec = Builder.CreateInsertElement(GatherVec, LoadedVal, Builder.getInt32(i), "gather.insert");
       }
-        
+    
+      // Clean Alloca (Prevent swifterror/huge alignment)
       Function *F = Batch.back()->getFunction();
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+    
+      // Use the simplest Alloca signature: Type, AddrSpace, Name
       AllocaInst *ContiguousBuf = EntryBuilder.CreateAlloca(VecTy, nullptr, "simd.shadow.buf");
+      // Set a sane alignment (e.g., 16 bytes for SIMD)
+      ContiguousBuf->setAlignment(Align(16));
+    
       Builder.CreateStore(GatherVec, ContiguousBuf);
-        
+    
+      // Issue the single Write
       Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), ElementBytes * NumElements);
       Value *BufCast = Builder.CreatePointerCast(ContiguousBuf, Builder.getPtrTy());
-        
+    
       std::vector<Value *> NewArgs;
       if (FirstArgs.Type == IOArgs::C_FWRITE) {
-	NewArgs = {BufCast, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+        NewArgs = {BufCast, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
       } else if (isExplicit) {
-	NewArgs = {FirstArgs.Target, BufCast, TotalLenVal, Batch[0]->getArgOperand(3)};
+        NewArgs = {FirstArgs.Target, BufCast, TotalLenVal, Batch[0]->getArgOperand(3)};
       } else {
-	NewArgs = {FirstArgs.Target, BufCast, TotalLenVal};
+        NewArgs = {FirstArgs.Target, BufCast, TotalLenVal};
       }
+    
       Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-
-      // Some applications expects each individual call to return the bytes written.
-      // We loop through the batch and replace the old return values with constants.
-      for (CallInst *C : Batch) {
-	if (!C->use_empty()) {
-	  // If the original code was checking 'if (bytes_written == expected)'
-	  // we give it the 'expected' value so the check passes.
-	  IOArgs OriginalArgs = getIOArguments(C);
-	  C->replaceAllUsesWith(OriginalArgs.Length);
-	}
-      }
-        
       errs() << "[IOOpt] SUCCESS: SIMD Gathered " << NumElements << " strided writes into 1!\n";
       break;
     }
-
     case IOPattern::ShadowBuffer: {
       Function *F = Batch.back()->getFunction();
+      // Move the Alloca to the Entry Block (standard LLVM practice)
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
-        
+
       Type *Int8Ty = Builder.getInt8Ty();
       ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
       AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
-      ShadowBuf->setAlignment(Align(4096)); // Force 4KB alignment for O_DIRECT device support
- 
-      uint64_t Offset = 0;
+      ShadowBuf->setAlignment(Align(16)); // Sane alignment for general use
+
+      // Pack the data into the buffer
+      uint64_t CurrentOffset = 0;
       for (size_t i = 0; i < Batch.size(); ++i) {
-	IOArgs Args = getIOArguments(Batch[i]);
-	uint64_t Len = cast<ConstantInt>(Args.Length)->getZExtValue();
-	Value *DestPtr = Builder.CreateInBoundsGEP(ShadowArrTy, ShadowBuf, {Builder.getInt32(0), Builder.getInt32(Offset)});
-	Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
-	Offset += Len;
+        IOArgs Args = getIOArguments(Batch[i]);
+
+        // Calculate the destination pointer inside our shadow buffer
+        Value *DestPtr = Builder.CreateInBoundsGEP(
+						   ShadowArrTy, ShadowBuf,
+						   {Builder.getInt32(0), Builder.getInt32(CurrentOffset)},
+						   "shadow.ptr"
+						   );
+
+        // We use the length from the specific call
+        Value *Len = Args.Length;
+        Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+
+        // Update the tracking offset for the next piece of data
+        if (auto *C = dyn_cast<ConstantInt>(Len)) {
+	  CurrentOffset += C->getZExtValue();
+        }
       }
-        
-      Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
+
+      // Emit the single merged write
+      Value *TotalLenVal = Builder.getIntN(
+					   FirstArgs.Length->getType()->getIntegerBitWidth(),
+					   TotalConstSize
+					   );
+
+      // Cast shadow.buf to ptr for the write call
+      Value *BufPtr = Builder.CreatePointerCast(ShadowBuf, Builder.getPtrTy());
+
       std::vector<Value *> NewArgs;
-      if (FirstArgs.Type == IOArgs::C_FWRITE) {
-	NewArgs = {ShadowBuf, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
-      } else if (isExplicit) {
-	NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal, Batch[0]->getArgOperand(3)};
+
+      if (FirstArgs.Type == IOArgs::MPI_WRITE_AT) {
+        NewArgs = {
+	  Batch[0]->getArgOperand(0), // fh
+	  Batch[0]->getArgOperand(1), // offset
+	  BufPtr,                     // coalesced stack array
+	  TotalLenVal,                // summed count
+	  Batch[0]->getArgOperand(4), // datatype
+	  Batch[0]->getArgOperand(5)  // status
+        };
+      } else if (FirstArgs.Type == IOArgs::C_FWRITE) {
+        // fwrite(buf, size, count, FILE*)
+        NewArgs = {BufPtr, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+      } else if (FirstArgs.Type == IOArgs::POSIX_PWRITE) {
+        // pwrite(fd, buf, count, offset)
+        NewArgs = {FirstArgs.Target, BufPtr, TotalLenVal, Batch[0]->getArgOperand(3)};
       } else {
-	NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal};
+        // Implicit writes: write(fd, buf, count)
+        NewArgs = {FirstArgs.Target, BufPtr, TotalLenVal};
       }
+
       Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-
-      // Some applications expects each individual call to return the bytes written.
-      // We loop through the batch and replace the old return values with constants.
-      for (CallInst *C : Batch) {
-	if (!C->use_empty()) {
-	  // If the original code was checking 'if (bytes_written == expected)'
-	  // we give it the 'expected' value so the check passes.
-	  IOArgs OriginalArgs = getIOArguments(C);
-	  C->replaceAllUsesWith(OriginalArgs.Length);
-	}
-      }
-
       errs() << "[IOOpt] SUCCESS: Shadow Buffered " << Batch.size() << " writes into 1 (" << TotalConstSize << " bytes)!\n";
       break;
     }
@@ -557,66 +640,62 @@ namespace {
       Type *Int32Ty = Builder.getInt32Ty();
       Type *PtrTy = PointerType::getUnqual(M->getContext());
       Type *SizeTy = DL.getIntPtrType(M->getContext());
-        
-      StringRef FuncName;
-      if (isExplicit) FuncName = isRead ? "preadv" : "pwritev";
-      else FuncName = isRead ? "readv" : "writev";
-
-      FunctionType *VecTy;
-      if (isExplicit) {
-	Type *OffsetTy = Batch[0]->getArgOperand(3)->getType(); 
-	VecTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty, OffsetTy}, false);
-      } else {
-	VecTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
-      }
-        
+            
+      StringRef FuncName = isRead ? (isExplicit ? "preadv" : "readv") : (isExplicit ? "pwritev" : "writev");
+      FunctionType *VecTy = isExplicit ? 
+	FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty, Batch[0]->getArgOperand(3)->getType()}, false) :
+	FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
+            
       FunctionCallee VecFunc = M->getOrInsertFunction(FuncName, VecTy);
-        
       StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
       ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
-        
+            
       Function *F = Batch.back()->getFunction();
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
       AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
-        
+            
       for (size_t i = 0; i < Batch.size(); ++i) {
 	IOArgs Args = getIOArguments(Batch[i]);
 	Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
 	Builder.CreateStore(Args.Buffer, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
 	Builder.CreateStore(Builder.CreateIntCast(Args.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
       }
-        
+           
+      // Decay the array pointer [N x iovec]* to iovec*
+      Value *IovBasePtr = Builder.CreateInBoundsGEP(
+						    IovArrayTy, IovArray, 
+						    {Builder.getInt32(0), Builder.getInt32(0)}, 
+						    "iovec.base.ptr"
+						    );
+ 
       Value *Fd = Builder.CreateIntCast(FirstArgs.Target, Int32Ty, false);
-        
       if (isExplicit) {
-	Value *StartOffset = Batch[0]->getArgOperand(3);
-	Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size()), StartOffset});
+	MergedCall = Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size()), Batch[0]->getArgOperand(3)});
       } else {
-	Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size())});
+	MergedCall = Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size())});
       }
-       
-      // Some application expects each individual call to return the bytes written.
-      // We loop through the batch and replace the old return values with constants.
-      for (CallInst *C : Batch) {
-	if (!C->use_empty()) {
-	  // If the original code was checking 'if (bytes_written == expected)'
-	  // we give it the 'expected' value so the check passes.
-	  IOArgs OriginalArgs = getIOArguments(C);
-	  C->replaceAllUsesWith(OriginalArgs.Length);
-	}
-      }
-  
-      errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " " 
-	     << (isRead ? "reads" : "writes") << " to " << FuncName << "!\n";
+      errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " " << (isRead ? "reads" : "writes") << " to " << FuncName << "!\n";
       break;
+    }
+    default: break;
     }
 
-    case IOPattern::Unprofitable:
-    default:
-      break;
-    }
+    // Inside flushBatch cleanup loop
+    for (CallInst *C : Batch) {
+      if (!C->use_empty()) {
+        // We "spoof" the return value by replacing it with the requested length.
+        // This makes the 'icmp' check (if len < 0) always result in 'false'.
+        Value *Rep = getIOArguments(C).Length;
         
-    for (CallInst *C : Batch) C->eraseFromParent();
+        if (C->getType() != Rep->getType()) {
+          Rep = Builder.CreateIntCast(Rep, C->getType(), false);
+        }
+        C->replaceAllUsesWith(Rep);
+      }
+      C->dropAllReferences();
+      C->eraseFromParent();
+    }
+    errs() << "[IOOpt] SUCCESS: Flushed batch of " << Batch.size() << " calls.\n"; 
     Batch.clear();
     return true;
   }
@@ -696,275 +775,190 @@ namespace {
     return false;
   }
   
-}
 
-struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
-  IOOptimisationPass() {
-    // Dynamically tune the pass during LTO based on environment variables
-    IOBatchThreshold = getEnvOrDefault("IO_BATCH_THRESHOLD", 4);
-    IOShadowBufferSize = getEnvOrDefault("IO_SHADOW_BUFFER_MAX", 4096);
-    IOHighWaterMark = getEnvOrDefault("IO_HIGH_WATER_MARK", 65536);
-  }
-
-  bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-    std::string FuncName = L->getHeader()->getParent()->getName().str();
-    errs() << "[IOOpt-Debug] Entering loop in " << FuncName << "\n";
-
-    BasicBlock *Preheader = L->getLoopPreheader();
-    if (!Preheader) {
-        errs() << "[IOOpt-Debug]   FAIL: No Preheader (Loop not simplified)\n";
-        return false;
+  struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
+    IOOptimisationPass() {
+      // Dynamically tune the pass during LTO based on environment variables
+      IOBatchThreshold = getEnvOrDefault("IO_BATCH_THRESHOLD", 4);
+      IOShadowBufferSize = getEnvOrDefault("IO_SHADOW_BUFFER_MAX", 4096);
+      IOHighWaterMark = getEnvOrDefault("IO_HIGH_WATER_MARK", 65536);
     }
 
-    // Instead of bailing on multiple exits, find the one that isn't an error return.
-    SmallVector<BasicBlock *, 4> ExitBlocks;
-    L->getExitBlocks(ExitBlocks);
-    
-    BasicBlock *SuccessExit = nullptr;
-    for (BasicBlock *EB : ExitBlocks) {
-        // A "Success Exit" is one that does not end in a ReturnInst (error-handling side exit)
-        // or it's the most common successor in the CFG.
-        if (!isa<ReturnInst>(EB->getTerminator())) {
-            SuccessExit = EB;
-            break;
-        }
-    }
+    bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
+      BasicBlock *ExitBB = L->getExitBlock();
+      BasicBlock *Preheader = L->getLoopPreheader();
+      if (!ExitBB || !Preheader) return false;
 
-    // Fallback: If we still can't find a unique success path, we must bail.
-    if (!SuccessExit) {
-        errs() << "[IOOpt-Debug] FAIL: Could not identify a non-returning Success Exit in " << FuncName << "\n";
-        return false;
-    }
+      unsigned TripCount = SE.getSmallConstantTripCount(L);
+      if (TripCount == 0) return false;
 
-    const SCEV *BTC = SE.getBackedgeTakenCount(L);
-    const SCEV *TripCountSCEV = nullptr;
+      bool LoopChanged = false;
 
-    if (!isa<SCEVCouldNotCompute>(BTC)) {
-        // Standard Case
-        TripCountSCEV = SE.getAddExpr(BTC, SE.getOne(BTC->getType()));
-    } else {
-        // Manual Case: Find the induction variable and its bound
-        std::optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
-    if (Bounds) {
-        Value &Initial = Bounds->getInitialIVValue();
-        Value &Final = Bounds->getFinalIVValue();
-        
-        // Compute: Final - Initial
-        const SCEV *InitialSCEV = SE.getSCEV(&Initial);
-        const SCEV *FinalSCEV = SE.getSCEV(&Final);
-        TripCountSCEV = SE.getMinusSCEV(FinalSCEV, InitialSCEV);
-        
-        errs() << "[IOOpt-Debug] Manually recovered Loop Bounds for " << FuncName << "\n";
-    }
-    }
-
-    if (!TripCountSCEV || isa<SCEVCouldNotCompute>(TripCountSCEV)) {
-        errs() << "[IOOpt-Debug] FAIL: Total Trip Count still uncomputable in " 
-               << L->getHeader()->getParent()->getName() << "\n";
-        return false;
-    }
-
-    bool LoopChanged = false;
-
-    for (BasicBlock *BB : L->blocks()) {
-        errs() << "[IOOpt-Debug]   Scanning Block: " << BB->getName() << "\n";
+      for (BasicBlock *BB : L->blocks()) {
         for (Instruction &I : llvm::make_early_inc_range(*BB)) {
-            auto *Call = dyn_cast<CallInst>(&I);
-            if (!Call) continue;
-
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs Args = getIOArguments(Call);
-            if (Args.Type == IOArgs::NONE) continue;
-
-            errs() << "[IOOpt-Debug]     Found I/O Call: " << Args.Type << "\n";
-
-            // 1. Memory Contiguity Check
-            const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
-const SCEV *LenSCEV = SE.getSCEV(Args.Length);
-Value *BasePointer = nullptr;
-
-if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
-    if (AddRec->getLoop() == L) {
-        const SCEV *Step = AddRec->getStepRecurrence(SE);
-        
-        // Handle the "Type Multiplier" - If Step > Len, it's likely writing multi-byte elements
-        // This is common in MPI where count is elements, but Step is bytes.
-        bool Contiguous = (Step == LenSCEV || SE.getTruncateOrZeroExtend(LenSCEV, Step->getType()) == Step);
-        
-        // Fallback: If Step is a multiple of Len, it might still be contiguous
-        // (e.g., writing 1 int (4 bytes) per iteration)
-        if (!Contiguous && isa<SCEVConstant>(Step) && isa<SCEVConstant>(LenSCEV)) {
-             uint64_t StepVal = cast<SCEVConstant>(Step)->getValue()->getZExtValue();
-             uint64_t LenVal = cast<SCEVConstant>(LenSCEV)->getValue()->getZExtValue();
-             if (StepVal > 0 && LenVal > 0) Contiguous = true; 
-        }
-
-        if (Contiguous) {
-             SCEVExpander Expander(SE, DL, "io.base");
-             BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
-        } else {
-            errs() << "[IOOpt-Debug]       FAIL: Step " << *Step << " != Len " << *LenSCEV << "\n";
-        }
-    }
-}
-
-            // 2. Disk Offset Check
-            Value *StartingOffset = nullptr;
-if (Args.Type == IOArgs::MPI_WRITE_AT || Args.Type == IOArgs::MPI_READ_AT) {
-    Value *OffsetOp = Call->getArgOperand(1); // Arg 1 is Offset
-    const SCEV *OffSCEV = SE.getSCEV(OffsetOp);
-    
-    if (auto *AddRecOff = dyn_cast<SCEVAddRecExpr>(OffSCEV)) {
-        const SCEV *StepOff = AddRecOff->getStepRecurrence(SE);
-        
-        // Normalize bit-widths! (i32 loop counter vs i64 disk offset)
-        const SCEV *NormalizedLen = SE.getTruncateOrZeroExtend(LenSCEV, StepOff->getType());
-        
-        if (StepOff == NormalizedLen || (isa<SCEVConstant>(StepOff) && isa<SCEVConstant>(NormalizedLen))) {
-            SCEVExpander OffExpander(SE, DL, "io.off");
-            StartingOffset = OffExpander.expandCodeFor(AddRecOff->getStart(), OffsetOp->getType(), Preheader->getTerminator());
-        } else {
-            errs() << "[IOOpt-Debug]       FAIL: Offset Step " << *StepOff << " mismatch with Len\n";
-        }
-    }
-}
-
-            // 3. Transformation (Reconstruction)
-            IRBuilder<> ExitBuilder(&*SuccessExit->getFirstInsertionPt());
             
-            const SCEV *TripCountSCEV = SE.getAddExpr(BTC, SE.getOne(BTC->getType()));
-            SCEVExpander TripExpander(SE, DL, "trip.count");
-            Value *VTripCount = TripExpander.expandCodeFor(TripCountSCEV, Args.Length->getType(), ExitBuilder.GetInsertPoint());
-            Value *TotalLenVal = ExitBuilder.CreateMul(VTripCount, Args.Length, "hoisted.total.len");
+            if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ) {
+                
+              auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
+              if (!ConstLen) continue;
 
-            if (Args.Type == IOArgs::MPI_WRITE_AT || Args.Type == IOArgs::MPI_READ_AT) {
-                std::vector<Value *> NewArgs = {Call->getArgOperand(0), StartingOffset, BasePointer, TotalLenVal, Call->getArgOperand(4), Call->getArgOperand(5)};
-                ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
-            } else {
-                ExitBuilder.CreateCall(Call->getCalledFunction(), {Args.Target, BasePointer, TotalLenVal});
+              uint64_t ElementSize = ConstLen->getZExtValue();
+              uint64_t TotalBytes = ElementSize * TripCount;
+
+              if (TotalBytes > IOHighWaterMark) continue;
+
+              if (!L->isLoopInvariant(Args.Target)) continue;
+
+              const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+              Value *BasePointer = nullptr;
+
+              if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+		if (AddRec->getLoop() == L) {
+		  if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
+		    if (StepConst->getValue()->getZExtValue() == ElementSize) {
+		      SCEVExpander Expander(SE, DL, "io.base.expander");
+		      BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
+		    }
+		  }
+		}
+              } else if (SE.isLoopInvariant(PtrSCEV, L)) {
+		SCEVExpander Expander(SE, DL, "io.base.expander");
+		BasePointer = Expander.expandCodeFor(PtrSCEV, Args.Buffer->getType(), Preheader->getTerminator());
+              }
+
+              if (!BasePointer) continue;
+
+              IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
+              Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
+              
+              std::vector<Value *> NewArgs = {Args.Target, BasePointer, TotalLenVal};
+              ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
+
+              errs() << "[IOOpt] SUCCESS: Hoisted Loop POSIX I/O! Scaled " << ElementSize 
+                     << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
+
+              Call->eraseFromParent();
+              LoopChanged = true;
             }
-
-            // Ensure the replacement matches the expected return type (e.g., i32 vs i64)
-            if (!Call->use_empty()) {
-                Value *Replacement = Args.Length;
-                if (Call->getType() != Args.Length->getType()) {
-                    IRBuilder<> CastBuilder(Call);
-                    Replacement = CastBuilder.CreateIntCast(Args.Length, Call->getType(), true);
-                }
-                Call->replaceAllUsesWith(Replacement);
-            }
-
-            // Clear all internal references within the instruction before deletion
-            // This prevents ConstantHoisting from trying to inspect operands of a dead instruction
-            Call->dropAllReferences(); 
-
-            errs() << "[IOOpt] SUCCESS: Hoisted and Cleaned Multi-Exit Loop I/O in " << FuncName << "\n";
-
-            // Final Erase
-            Call->eraseFromParent();
-            
-            // Stop processing this loop and return true immediately.
-            // This forces the Pass Manager to refresh ScalarEvolution and other analyses.
-            return true;
+          }
         }
+      }
+      return LoopChanged;
     }
-    return LoopChanged;
-}   
- 
+
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-    errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
-    bool Changed = false;
+      errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
+      bool Changed = false;
 
-    AAResults &AA = FAM.getResult<AAManager>(F);
-    const DataLayout &DL = F.getParent()->getDataLayout();
-    LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
-    ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+      AAResults &AA = FAM.getResult<AAManager>(F);
+      const DataLayout &DL = F.getParent()->getDataLayout();
+      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+      ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
 
-    for (Loop *L : LI.getLoopsInPreorder()) {
-      if (optimiseLoopIO(L, SE, DL)) Changed = true;
-    }
-
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : llvm::make_early_inc_range(BB)) {
-	if (auto *Call = dyn_cast<CallInst>(&I)) {
-	  IOArgs CArgs = getIOArguments(Call);
-	  if (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD || CArgs.Type == IOArgs::POSIX_PREAD) {
-	    if (hoistRead(Call, AA, DL)) Changed = true;
-	  }
-	}
+      for (Loop *L : LI.getLoopsInPreorder()) {
+        if (optimiseLoopIO(L, SE, DL)) Changed = true;
       }
-    }
 
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : llvm::make_early_inc_range(llvm::reverse(BB))) {
-	if (auto *Call = dyn_cast<CallInst>(&I)) {
-	  IOArgs CArgs = getIOArguments(Call);
-	  if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || 
-	      CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE) {
-	    if (sinkWrite(Call, AA, DL)) Changed = true;
-	  }
-	}
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : llvm::make_early_inc_range(BB)) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+            IOArgs CArgs = getIOArguments(Call);
+            if (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD || CArgs.Type == IOArgs::POSIX_PREAD) {
+              if (hoistRead(Call, AA, DL)) Changed = true;
+            }
+          }
+        }
       }
-    }
 
-    // Phase 4: Cross-Block Stitching Batcher
-    std::set<BasicBlock*> Visited;
-    for (BasicBlock &BB : F) {
-      if (Visited.count(&BB)) continue;
-
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : llvm::make_early_inc_range(llvm::reverse(BB))) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+            IOArgs CArgs = getIOArguments(Call);
+            if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || 
+                CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE) {
+              if (sinkWrite(Call, AA, DL)) Changed = true;
+            }
+          }
+        }
+      }
+     
+      // Phase 4: Function-level batching (Cross-Block)
       std::vector<CallInst*> IOBatch;
-      BasicBlock *CurrentBB = &BB;
+      uint64_t CurrentBatchBytes = 0;
 
-      while (CurrentBB) {
-	Visited.insert(CurrentBB);
-	bool HazardInBlock = false;
-
-	for (Instruction &I : llvm::make_early_inc_range(*CurrentBB)) {
-	  if (auto *Call = dyn_cast<CallInst>(&I)) {
-	    if (getIOArguments(Call).Type != IOArgs::NONE) {
-	      if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE)) {
-		IOBatch.push_back(Call);
-	      } else {
-		HazardInBlock = true;
-		break; 
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : llvm::make_early_inc_range(BB)) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+              
+            if (Function *CalleeF = Call->getCalledFunction()) {
+	      StringRef FuncName = CalleeF->getName();
+	      if (FuncName == "fsync" || FuncName == "fdatasync" || 
+		  FuncName == "sync_file_range" || FuncName == "posix_fadvise" || 
+		  FuncName == "posix_fadvise64" || FuncName == "madvise") {
+                    
+		// Flush immediately to prevent crossing the sync barrier
+		if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
+		CurrentBatchBytes = 0;
+		continue; 
 	      }
-	    }
-	  }
-	}
+            }
 
-	if (HazardInBlock) break;
+            IOArgs CArgs = getIOArguments(Call);
 
-	// Stitching Logic: Follow the path that continues I/O
-	Instruction *Term = CurrentBB->getTerminator();
-	BasicBlock *NextBB = nullptr;
-	if (auto *BI = dyn_cast<BranchInst>(Term)) {
-	  if (BI->isConditional()) {
-	    // Enable the following  pattern: if (err) return; else continue;
-	    // We follow the successor that does not return.
-	    for (BasicBlock *Succ : BI->successors()) {
-	      if (!isa<ReturnInst>(Succ->getTerminator())) {
-		NextBB = Succ;
-		break;
-	      }
-	    }
-	  } else {
-	    NextBB = BI->getSuccessor(0);
-	  }
-	}
+            bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || 
+                            CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE || 
+                            CArgs.Type == IOArgs::MPI_WRITE_AT);
+            
+            bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD || 
+                           CArgs.Type == IOArgs::POSIX_PREAD || CArgs.Type == IOArgs::MPI_READ_AT);
 
-	// Only follow if the next block has only one predecessor (us)
-	if (NextBB && NextBB->getSinglePredecessor() == CurrentBB && !Visited.count(NextBB))
-	  CurrentBB = NextBB;
-	else
-	  CurrentBB = nullptr;
+            if (isWrite || isRead) {
+              uint64_t CallBytes = 4096; // Fallback for variable lengths
+              if (auto *ConstLen = dyn_cast<ConstantInt>(CArgs.Length)) {
+		CallBytes = ConstLen->getZExtValue();
+              }
+
+              // If we are switching between Read and Write, flush the current batch
+              if (!IOBatch.empty()) {
+                IOArgs BatchArgs = getIOArguments(IOBatch.front());
+                bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD || 
+                                    BatchArgs.Type == IOArgs::POSIX_PREAD || BatchArgs.Type == IOArgs::MPI_READ_AT);
+                if (BatchIsRead != isRead) {
+		  if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
+		  CurrentBatchBytes = 0;
+                }
+              }
+
+              // Check for memory/disk hazards using our cross-block scanner
+              if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE)) {
+                IOBatch.push_back(Call);
+                CurrentBatchBytes += CallBytes;
+
+                // High Water Mark constraint
+                if (CurrentBatchBytes >= IOHighWaterMark) {
+                  if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
+                  CurrentBatchBytes = 0;
+                }
+              } else {
+                // Hazard detected. Flush the existing batch and start a new one.
+                if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
+                IOBatch.push_back(Call);
+                CurrentBatchBytes = CallBytes; 
+              }
+            }
+          }
+        }
       }
-
+      
       if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
-    }
-    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
-  }
 
-};
-
+      return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    } 
+     
+  };
+}
 
 struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
@@ -1017,7 +1011,6 @@ llvmGetPassPluginInfo() {
 					 [](StringRef Name, FunctionPassManager &FPM,
 					    ArrayRef<PassBuilder::PipelineElement>) {
 					   if (Name == "io-opt") {
-					     FPM.addPass(LoopSimplifyPass());
 					     FPM.addPass(IOOptimisationPass()); 
 					     return true;
 					   }
