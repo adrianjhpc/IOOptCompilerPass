@@ -16,6 +16,7 @@ target_compile_options(pixel_write_fast PRIVATE
 
 # Ensure bench_fast only builds after the plugin is ready
 add_dependencies(pixel_write_fast IOOpt)
+set_target_properties(pixel_write_fast PROPERTIES LINK_DEPENDS "$<TARGET_FILE:IOOpt>")
 
 # HTTP Server benchmark
 
@@ -33,6 +34,7 @@ target_compile_options(http_fast PRIVATE
 )
 # Ensure the pass is built before compiling this benchmark
 add_dependencies(http_fast IOOpt)
+set_target_properties(http_fast PROPERTIES LINK_DEPENDS "$<TARGET_FILE:IOOpt>")
 
 # Database WAL benchmark
 
@@ -44,6 +46,7 @@ target_compile_options(wal_standard PRIVATE -O3 -fno-inline)
 add_executable(wal_fast database_wal_benchmark.cpp)
 target_compile_options(wal_fast PRIVATE -O3 -fno-inline -fpass-plugin=$<TARGET_FILE:IOOpt>)
 add_dependencies(wal_fast IOOpt)
+set_target_properties(wal_fast PROPERTIES LINK_DEPENDS "$<TARGET_FILE:IOOpt>")
 
 # Multimedia streaming benchmark
 
@@ -55,6 +58,7 @@ target_compile_options(media_standard PRIVATE -O3 -fno-inline)
 add_executable(media_fast media_benchmark.cpp)
 target_compile_options(media_fast PRIVATE -O3 -fno-inline -fpass-plugin=$<TARGET_FILE:IOOpt>)
 add_dependencies(media_fast IOOpt)
+set_target_properties(media_fast PROPERTIES LINK_DEPENDS "$<TARGET_FILE:IOOpt>")
 
 # LTO cross-file benchmark
 
@@ -76,10 +80,11 @@ target_compile_options(lto_fast PRIVATE -O3 -flto=full -fpass-plugin=$<TARGET_FI
 target_link_options(lto_fast PRIVATE -O3 -flto=full -fuse-ld=lld "-Wl,--load-pass-plugin=$<TARGET_FILE:IOOpt>")
 
 add_dependencies(lto_fast IOOpt)
+set_target_properties(lto_fast PROPERTIES LINK_DEPENDS "$<TARGET_FILE:IOOpt>")
 
 # MPI-IO Benchmarks (HPC Evaluation)
 if(MPI_CXX_FOUND)
-    message(STATUS "MPI Found: Generating Baseline and Optimized Benchmarks")
+    message(STATUS "MPI Found: Generating MPI benchmarks")
 
     # 1. The Baseline Binary (Compiled normally, no pass injected)
     add_executable(mpi_write_at_standard mpi_write_at_benchmark.cpp)
@@ -102,6 +107,18 @@ if(MPI_CXX_FOUND)
     
     # Ensure the plugin is compiled BEFORE the optimized benchmark tries to link
     add_dependencies(mpi_write_at_fast IOOpt)
+
+    # Force rebuild/relink of the benchmark if libIOOpt.so changes
+    set_target_properties(mpi_write_at_fast PROPERTIES 
+        LINK_DEPENDS "$<TARGET_FILE:IOOpt>"
+    )
+
+    # Wrap the compiler and linker calls with the required environment variable
+    # so getEnvOrDefault picks it up during the build process.
+    set_target_properties(mpi_write_at_fast PROPERTIES
+        CXX_COMPILER_LAUNCHER "${CMAKE_COMMAND};-E;env;IO_SHADOW_BUFFER_MAX=65536"
+        CXX_LINKER_LAUNCHER   "${CMAKE_COMMAND};-E;env;IO_SHADOW_BUFFER_MAX=65536"
+    )
 
 else()
     message(WARNING "MPI CXX compiler not found. Skipping MPI benchmarks")
