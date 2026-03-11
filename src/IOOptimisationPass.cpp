@@ -185,6 +185,13 @@ namespace {
       if (!isContiguous) return false;
 
     } else if (NewArgs.Type == IOArgs::MPI_READ_AT || NewArgs.Type == IOArgs::MPI_WRITE_AT) {
+
+      // If the application provides different status pointers for each call,
+      // we cannot safely batch them without causing uninitialized memory reads
+      if (LastCall->getArgOperand(5) != NewCall->getArgOperand(5)) {
+          return false;
+      }
+
       // MPI Smart Datatype Checking (resolve opaque pointer loads)
       Value *DT1 = LastCall->getArgOperand(4);
       Value *DT2 = NewCall->getArgOperand(4);
@@ -690,15 +697,29 @@ namespace {
     }
 
     // Inside flushBatch cleanup loop
+    // Inside flushBatch cleanup loop
     for (CallInst *C : Batch) {
       if (!C->use_empty()) {
-        // We "spoof" the return value by replacing it with the requested length.
-        // This makes the 'icmp' check (if len < 0) always result in 'false'.
-        Value *Rep = getIOArguments(C).Length;
+        IOArgs CArgs = getIOArguments(C);
+        Value *Rep;
         
-        if (C->getType() != Rep->getType()) {
-          Rep = Builder.CreateIntCast(Rep, C->getType(), false);
+        if (CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::MPI_READ_AT) {
+            // MPI expects an error code (0 = MPI_SUCCESS)
+            Rep = Builder.getInt32(0);
+        } else if (CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::C_FREAD) {
+            // C Standard Library expects the 'count' argument (Operand 2)
+            Rep = C->getArgOperand(2); 
+            if (C->getType() != Rep->getType()) {
+                Rep = Builder.CreateIntCast(Rep, C->getType(), false);
+            }
+        } else {
+            // POSIX expects the total byte length
+            Rep = CArgs.Length;
+            if (C->getType() != Rep->getType()) {
+                Rep = Builder.CreateIntCast(Rep, C->getType(), false);
+            }
         }
+        
         C->replaceAllUsesWith(Rep);
       }
       C->dropAllReferences();
