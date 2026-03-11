@@ -46,18 +46,18 @@ namespace {
 
     // Helper to get total bytes for C streams (size * count)
     auto getCStreamBytes = [](CallInst *CI) -> Value* {
-        Value *Size = CI->getArgOperand(1);
-        Value *Count = CI->getArgOperand(2);
-        if (auto *CSize = dyn_cast<ConstantInt>(Size)) {
-            if (CSize->getZExtValue() == 1) return Count;
-            if (auto *CCount = dyn_cast<ConstantInt>(Count)) {
-                return ConstantInt::get(Count->getType(), CSize->getZExtValue() * CCount->getZExtValue());
-            }
-        }
-        if (auto *CCount = dyn_cast<ConstantInt>(Count)) {
-            if (CCount->getZExtValue() == 1) return Size;
-        }
-        return nullptr; // Return null to safely block batching if sizes are unpredictable
+      Value *Size = CI->getArgOperand(1);
+      Value *Count = CI->getArgOperand(2);
+      if (auto *CSize = dyn_cast<ConstantInt>(Size)) {
+	if (CSize->getZExtValue() == 1) return Count;
+	if (auto *CCount = dyn_cast<ConstantInt>(Count)) {
+	  return ConstantInt::get(Count->getType(), CSize->getZExtValue() * CCount->getZExtValue());
+	}
+      }
+      if (auto *CCount = dyn_cast<ConstantInt>(Count)) {
+	if (CCount->getZExtValue() == 1) return Size;
+      }
+      return nullptr; // Return null to safely block batching if sizes are unpredictable
     };
 
     Function *F = Call->getCalledFunction();
@@ -143,23 +143,23 @@ namespace {
     IOArgs NewArgs = getIOArguments(NewCall);
 
     if (LastCall->getParent() != NewCall->getParent()) {
-        // We only permit cross-block batching for raw POSIX calls. This allows us to 
-        // aggressively bypass standard 'if (bytes < 0)' system call error checks. 
-        // Buffered streams (fwrite, C++) and MPI are strictly restricted to the same block 
-        // to prevent text from being lost across un-spoofable application logic branches.
-        if (FirstArgs.Type != IOArgs::POSIX_WRITE && 
-            FirstArgs.Type != IOArgs::POSIX_PWRITE && 
-            FirstArgs.Type != IOArgs::POSIX_READ && 
-            FirstArgs.Type != IOArgs::POSIX_PREAD) {
+      // We only permit cross-block batching for raw POSIX calls. This allows us to 
+      // aggressively bypass standard 'if (bytes < 0)' system call error checks. 
+      // Buffered streams (fwrite, C++) and MPI are strictly restricted to the same block 
+      // to prevent text from being lost across un-spoofable application logic branches.
+      if (FirstArgs.Type != IOArgs::POSIX_WRITE && 
+	  FirstArgs.Type != IOArgs::POSIX_PWRITE && 
+	  FirstArgs.Type != IOArgs::POSIX_READ && 
+	  FirstArgs.Type != IOArgs::POSIX_PREAD) {
             
-            errs() << "[IOOpt-Debug] Batch Break: Cross-block batching disabled for non-POSIX type.\n";
-            return false;
-        }
+	errs() << "[IOOpt-Debug] Batch Break: Cross-block batching disabled for non-POSIX type.\n";
+	return false;
+      }
     }
 
     if (!DT.dominates(LastCall, NewCall)) {
-        errs() << "[IOOpt-Debug] Batch Break: CFG Dominance violation.\n";
-        return false;
+      errs() << "[IOOpt-Debug] Batch Break: CFG Dominance violation.\n";
+      return false;
     }
 
     if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) {
@@ -216,7 +216,7 @@ namespace {
       // If the application provides different status pointers for each call,
       // we cannot safely batch them without causing uninitialized memory reads
       if (LastCall->getArgOperand(5) != NewCall->getArgOperand(5)) {
-          return false;
+	return false;
       }
 
       // MPI Smart Datatype Checking (resolve opaque pointer loads)
@@ -245,13 +245,13 @@ namespace {
 	  if (ExpectedNext == SNew) {
 	    isContiguous = true;
 	  } else {
-          // TODO Fix this by enabling zero padding of the shadow buffer
+	    // TODO Fix this by enabling zero padding of the shadow buffer
 	    // Gap Tolerance: Allow small jumps (e.g., < 1024 bytes) for Shadow Buffering
-	   // const SCEV *GapSCEV = SE.getMinusSCEV(SNew, ExpectedNext);
-	  //  if (auto *ConstGap = dyn_cast<SCEVConstant>(GapSCEV)) {
-	  //    int64_t GapVal = ConstGap->getValue()->getSExtValue();
-	  //    if (GapVal > 0 && GapVal < 1024) isContiguous = true;
-	  //  }
+	    // const SCEV *GapSCEV = SE.getMinusSCEV(SNew, ExpectedNext);
+	    //  if (auto *ConstGap = dyn_cast<SCEVConstant>(GapSCEV)) {
+	    //    int64_t GapVal = ConstGap->getValue()->getSExtValue();
+	    //    if (GapVal > 0 && GapVal < 1024) isContiguous = true;
+	    //  }
 	  }
         }
       }
@@ -322,11 +322,12 @@ namespace {
 
       // Opaque Barriers and Lifetimes
       if (auto *CI = dyn_cast<CallInst>(CurrInst)) {
-        if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
-            CI->getIntrinsicID() == Intrinsic::lifetime_start) {
-          return false;
-        }
+        // We stripped lifetime markers in Phase 0, so we no longer check for them here.
+        
+        // Hazard: Never batch across another I/O call
         if (getIOArguments(CI).Type != IOArgs::NONE) return false;
+        
+        // Hazard: Never batch across an opaque function that might write to memory
         if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
       }
 
@@ -448,8 +449,8 @@ namespace {
         uint64_t ElementBytes = ConstLen->getZExtValue();
         // ONLY allow native CPU hardware widths (8, 16, 32, 64 bits)
         if (ElementBytes == 1 || ElementBytes == 2 || ElementBytes == 4 || ElementBytes == 8) {
-            OutTotalRange = ElementBytes;
-            return IOPattern::Strided;
+	  OutTotalRange = ElementBytes;
+	  return IOPattern::Strided;
         }
       }
     }
@@ -637,10 +638,10 @@ namespace {
         IRBuilder<> CallBuilder(C);
 
         Value *DestPtr = CallBuilder.CreateInBoundsGEP(
-                           ShadowArrTy, ShadowBuf,
-                           {CallBuilder.getInt32(0), CallBuilder.getInt32(CurrentOffset)},
-                           "shadow.ptr"
-                           );
+						       ShadowArrTy, ShadowBuf,
+						       {CallBuilder.getInt32(0), CallBuilder.getInt32(CurrentOffset)},
+						       "shadow.ptr"
+						       );
 
         Value *Len = Args.Length;
         CallBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
@@ -690,7 +691,9 @@ namespace {
       Function *F = Batch.back()->getFunction();
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
       AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
-            
+
+      IovArray->setAlignment(Align(8));
+      
       for (size_t i = 0; i < Batch.size(); ++i) {
 	IOArgs Args = getIOArguments(Batch[i]);
 	Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
@@ -724,23 +727,23 @@ namespace {
         Value *Rep;
        
         if (CArgs.Type == IOArgs::CXX_WRITE) {
-            // C++ write returns 'this' (the stream pointer, Operand 0)
-            Rep = C->getArgOperand(0);	
+	  // C++ write returns 'this' (the stream pointer, Operand 0)
+	  Rep = C->getArgOperand(0);	
 	} else if (CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::MPI_READ_AT) {
-            // MPI expects an error code (0 = MPI_SUCCESS)
-            Rep = Builder.getInt32(0);
+	  // MPI expects an error code (0 = MPI_SUCCESS)
+	  Rep = Builder.getInt32(0);
         } else if (CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::C_FREAD) {
-            // C Standard Library expects the 'count' argument (Operand 2)
-            Rep = C->getArgOperand(2); 
-            if (C->getType() != Rep->getType()) {
-                Rep = Builder.CreateIntCast(Rep, C->getType(), false);
-            }
+	  // C Standard Library expects the 'count' argument (Operand 2)
+	  Rep = C->getArgOperand(2); 
+	  if (C->getType() != Rep->getType()) {
+	    Rep = Builder.CreateIntCast(Rep, C->getType(), false);
+	  }
         } else {
-            // POSIX expects the total byte length
-            Rep = CArgs.Length;
-            if (C->getType() != Rep->getType()) {
-                Rep = Builder.CreateIntCast(Rep, C->getType(), false);
-            }
+	  // POSIX expects the total byte length
+	  Rep = CArgs.Length;
+	  if (C->getType() != Rep->getType()) {
+	    Rep = Builder.CreateIntCast(Rep, C->getType(), false);
+	  }
         }
         
         C->replaceAllUsesWith(Rep);
@@ -763,15 +766,28 @@ namespace {
     
     while (true) {
       if (CurrentInst) {
-        if (!CurrentInst->isTerminator() && !isa<PHINode>(CurrentInst)) {
+	if (!CurrentInst->isTerminator() && !isa<PHINode>(CurrentInst)) {
           bool DependsOnPrev = false;
           for (Value *Op : ReadCall->operands()) if (Op == CurrentInst) { DependsOnPrev = true; break; }
           if (DependsOnPrev) break;
+          
+          if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
+            // Hazard: Never hoist past another I/O call
+            if (getIOArguments(CI).Type != IOArgs::NONE) break;
+            
+            // Hazard: Never hoist past an opaque function that might write memory
+            if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) break;
+          }          
+          
           if (CurrentInst->mayReadOrWriteMemory()) {
             if (isModOrRefSet(AA.getModRefInfo(CurrentInst, DestLoc))) break;
-            MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
-            if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+            
+            if (Args.Target->getType()->isPointerTy()) {
+	      MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+	      if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+            }
           }
+
           InsertPoint = CurrentInst;
         }
         CurrentInst = CurrentInst->getPrevNode();
@@ -802,19 +818,19 @@ namespace {
     while (CurrentInst) {
       if (CurrentInst->isTerminator() || isa<PHINode>(CurrentInst)) break;
       if (CurrentInst->mayThrow()) break;
-      
+
       if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
-        if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
-            CI->getIntrinsicID() == Intrinsic::lifetime_start) {
-	  break;
-        }
-        if (getIOArguments(CI).Type != IOArgs::NONE) break;
+        if (getIOArguments(CI).Type != IOArgs::NONE) return false;
+        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
       }
       
       if (CurrentInst->mayReadOrWriteMemory()) {
         if (isModSet(AA.getModRefInfo(CurrentInst, SrcLoc))) break;
-        MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
-        if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+        
+        if (Args.Target->getType()->isPointerTy()) {
+	  MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+	  if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+        }
       }
       
       InsertPoint = CurrentInst;
@@ -865,8 +881,8 @@ namespace {
               // Capture the item 'size' argument for C library streams
               Value *ExtraArg = nullptr;
               if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
-                  ExtraArg = Call->getArgOperand(1);
-                  if (!L->isLoopInvariant(ExtraArg)) continue; 
+		ExtraArg = Call->getArgOperand(1);
+		if (!L->isLoopInvariant(ExtraArg)) continue; 
               }
 
               if (!L->isLoopInvariant(Args.Target)) continue;
@@ -917,6 +933,28 @@ namespace {
       errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
       bool Changed = false;
 
+      std::vector<Instruction*> Lifetimes; // <-- Declaration is here at the function scope
+      
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (CI->getIntrinsicID() == Intrinsic::lifetime_end) {
+              Lifetimes.push_back(CI);
+            }
+          }
+        }
+      }
+      
+      // Now we delete them. Because Lifetimes was declared outside the loops, it is visible here!
+      for (Instruction *I : Lifetimes) {
+	I->eraseFromParent();
+      }
+      
+      if (!Lifetimes.empty()) {
+	Changed = true;
+      }
+      
+            
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
@@ -933,7 +971,7 @@ namespace {
             IOArgs CArgs = getIOArguments(Call);
             if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::POSIX_READ ||
                 CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::C_FREAD) {
-	       if (hoistRead(Call, AA, DL)) Changed = true;
+	      if (hoistRead(Call, AA, DL)) Changed = true;
             }
           }
         }
