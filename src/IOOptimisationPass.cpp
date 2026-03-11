@@ -43,6 +43,23 @@ namespace {
   };
 
   IOArgs getIOArguments(CallInst *Call) {
+
+    // Helper to get total bytes for C streams (size * count)
+    auto getCStreamBytes = [](CallInst *CI) -> Value* {
+        Value *Size = CI->getArgOperand(1);
+        Value *Count = CI->getArgOperand(2);
+        if (auto *CSize = dyn_cast<ConstantInt>(Size)) {
+            if (CSize->getZExtValue() == 1) return Count;
+            if (auto *CCount = dyn_cast<ConstantInt>(Count)) {
+                return ConstantInt::get(Count->getType(), CSize->getZExtValue() * CCount->getZExtValue());
+            }
+        }
+        if (auto *CCount = dyn_cast<ConstantInt>(Count)) {
+            if (CCount->getZExtValue() == 1) return Size;
+        }
+        return nullptr; // Return null to safely block batching if sizes are unpredictable
+    };
+
     Function *F = Call->getCalledFunction();
     if (!F || !F->hasName() || !F->isDeclaration()) return {nullptr, nullptr, nullptr, IOArgs::NONE};
 
@@ -57,8 +74,8 @@ namespace {
     if (Demangled == "read" || Demangled == "read64")   return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ};
 
     // Buffered C-Library
-    if (Demangled == "fwrite") return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FWRITE};
-    if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FREAD};
+    if (Demangled == "fwrite") return {Call->getArgOperand(3), Call->getArgOperand(0), getCStreamBytes(Call), IOArgs::C_FWRITE};
+    if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), getCStreamBytes(Call), IOArgs::C_FREAD};
 
     // Signature: (fh, offset, buf, count, datatype, status)
     if (Demangled == "MPI_File_write_at" || Demangled == "PMPI_File_write_at") return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
@@ -524,7 +541,8 @@ namespace {
       if (FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::MPI_READ_AT) {
 	NewArgs = { Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), FirstArgs.Buffer, TotalLen, Batch[0]->getArgOperand(4), Batch[0]->getArgOperand(5) };
       } else if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
-	NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
+        Value *SizeOne = Builder.getIntN(TotalLen->getType()->getIntegerBitWidth(), 1);
+        NewArgs = {FirstArgs.Buffer, SizeOne, TotalLen, FirstArgs.Target};
       } else if (isExplicit) {
 	NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen, Batch[0]->getArgOperand(3)};
       } else {
@@ -573,7 +591,8 @@ namespace {
     
       std::vector<Value *> NewArgs;
       if (FirstArgs.Type == IOArgs::C_FWRITE) {
-        NewArgs = {BufCast, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+        Value *SizeOne = Builder.getIntN(TotalLenVal->getType()->getIntegerBitWidth(), 1);
+        NewArgs = {BufCast, SizeOne, TotalLenVal, FirstArgs.Target};
       } else if (isExplicit) {
         NewArgs = {FirstArgs.Target, BufCast, TotalLenVal, Batch[0]->getArgOperand(3)};
       } else {
@@ -638,7 +657,8 @@ namespace {
         };
       } else if (FirstArgs.Type == IOArgs::C_FWRITE) {
         // fwrite(buf, size, count, FILE*)
-        NewArgs = {BufPtr, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+        Value *SizeOne = Builder.getIntN(TotalLenVal->getType()->getIntegerBitWidth(), 1);
+        NewArgs = {BufPtr, SizeOne, TotalLenVal, FirstArgs.Target};
       } else if (FirstArgs.Type == IOArgs::POSIX_PWRITE) {
         // pwrite(fd, buf, count, offset)
         NewArgs = {FirstArgs.Target, BufPtr, TotalLenVal, Batch[0]->getArgOperand(3)};
