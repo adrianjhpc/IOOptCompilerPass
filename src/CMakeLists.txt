@@ -2,6 +2,8 @@
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+
 # Our pass is a loadable module (shared library)
 add_library(IOOpt MODULE IOOptimisationPass.cpp)
 
