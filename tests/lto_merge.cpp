@@ -4,12 +4,12 @@
 // RUN: echo '__attribute__((always_inline)) void write_payload(int fd, const char* data) { write(fd, data, strlen(data)); write(fd, "\n", 1); }' >> %t.logger.cpp
 
 // This generates perfectly clean IR without prematurely running any optimizations!
-// RUN: clang++-20 -O0 -Xclang -disable-O0-optnone -emit-llvm -c %s -o %t.main.bc
-// RUN: clang++-20 -O0 -Xclang -disable-O0-optnone -emit-llvm -c %t.logger.cpp -o %t.logger.bc
+// RUN: %ppclang -O0 -Xclang -disable-O0-optnone -emit-llvm -c %s -o %t.main.bc
+// RUN: %ppclang -O0 -Xclang -disable-O0-optnone -emit-llvm -c %t.logger.cpp -o %t.logger.bc
 
-// RUN: llvm-link-20 %t.main.bc %t.logger.bc -o %t.merged.bc
+// RUN: %llvmlink %t.main.bc %t.logger.bc -o %t.merged.bc
 
-// RUN: opt-20 -load-pass-plugin=../build/src/libIOOpt.so -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | FileCheck-20 %s
+// RUN: %opt -load-pass-plugin=../build/src/libIOOpt.so -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | %FileCheck %s
 #include <unistd.h>
 #include <string.h>
 

@@ -15,8 +15,18 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 find_program(LIT_TOOL NAMES llvm-lit-20 lit-20 llvm-lit lit)
 
 if(LIT_TOOL)
+
+
     message(STATUS "Found lit test tool: ${LIT_TOOL}")
 
+
+    # Find test tools on the current system
+    find_program(CLANG_PATH NAMES clang-20 clang)
+    find_program(CLANGPP_PATH NAMES clang++-20 clang++)
+    find_program(OPT_PATH NAMES opt-20 opt)
+    find_program(FILECHECK_PATH NAMES FileCheck-20 FileCheck)
+    find_program(LLVM_LINK_PATH NAMES llvm-link-20 llvm-link)
+     
     set(IO_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
     set(IO_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
     set(IO_SHLIB_EXT ${CMAKE_SHARED_LIBRARY_SUFFIX})

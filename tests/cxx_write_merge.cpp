@@ -1,4 +1,4 @@
-// RUN: clang++-20 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | opt-20 -load-pass-plugin=%S/../build/src/libIOOpt.so -passes="mem2reg,instcombine,io-opt" -S | FileCheck-20 %s
+// RUN: %ppclang -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | %opt -load-pass-plugin=%S/../build/src/libIOOpt.so -passes="mem2reg,instcombine,io-opt" -S | %FileCheck %s
 
 #include <iostream>
 

@@ -1,4 +1,4 @@
-// RUN: clang++-20 -O2 -fno-inline -emit-llvm -S -c %s -o - | opt-20 -load-pass-plugin=/mnt/pvc/IOCompiler/build/src/libIOOpt.so -passes=io-opt -S | FileCheck-20 %s
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=/mnt/pvc/IOCompiler/build/src/libIOOpt.so -passes=io-opt -S | %FileCheck %s
 
 // --- MOCK MPI TYPES ---
 typedef void* MPI_File;

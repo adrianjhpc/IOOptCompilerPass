@@ -1,6 +1,6 @@
-// RUN: clang++-20 -O1 -fno-inline -emit-llvm -S -c %s -o - | \
-// RUN: env IO_HIGH_WATER_MARK=32768 opt-20 -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes=io-opt -S | \
-// RUN: FileCheck-20 %s
+// RUN: %ppclang -O1 -fno-inline -emit-llvm -S -c %s -o - | \
+// RUN: env IO_HIGH_WATER_MARK=32768 %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes=io-opt -S | \
+// RUN: %FileCheck %s
 #include <unistd.h>
 
 // CHECK-LABEL: define {{.*}}test_highwater_loop
