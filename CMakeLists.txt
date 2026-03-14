@@ -50,8 +50,8 @@ if(LIT_TOOL)
 
     # This creates a 'lit.site.cfg.py' in the build directory with real paths
     configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.site.cfg.py.in
-	${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.site.cfg.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/llvm-tests/lit.site.cfg.py.in
+	${CMAKE_CURRENT_SOURCE_DIR}/llvm-tests/lit.site.cfg.py
         @ONLY
     )
 
@@ -59,7 +59,7 @@ if(LIT_TOOL)
     # 2. Create a custom 'check' target
     add_custom_target(check
         # Run lit on the test/ directory, passing the -v (verbose) flag
-        COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/llvm-tests
         
         # VERY IMPORTANT: Make the tests depend on the pass itself!
         # This forces CMake to recompile IOOpt.so if you changed the C++ code
@@ -81,3 +81,4 @@ find_package(MPI)
 
 add_subdirectory(llvm-src)
 add_subdirectory(benchmarks)
+add_subdirectory(mlir-src)
