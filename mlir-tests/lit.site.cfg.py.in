@@ -1,0 +1,11 @@
+@LIT_SITE_CFG_IN_HEADER@
+
+config.llvm_tools_dir = "@LLVM_TOOLS_BINARY_DIR@"
+config.io_obj_root = "@CMAKE_CURRENT_BINARY_DIR@"
+config.io_tools_dir = "@CMAKE_CURRENT_BINARY_DIR@/../mlir-src"
+
+import lit.llvm
+lit.llvm.initialize(lit_config, config)
+
+# Let the main config do the real work.
+lit_config.load_config(config, "@CMAKE_CURRENT_SOURCE_DIR@/lit.cfg.py")

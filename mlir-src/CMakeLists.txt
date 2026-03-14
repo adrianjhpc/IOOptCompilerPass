@@ -1,5 +1,7 @@
 include_directories(${MLIR_INCLUDE_DIRS})
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
+
 # Run TableGen to generate Dialect C++ code from IODialect.td
 set(LLVM_TARGET_DEFINITIONS ${CMAKE_CURRENT_SOURCE_DIR}/IODialect.td)
 
@@ -39,4 +41,20 @@ target_include_directories(MLIRIOOptimiser PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}             # For IODialect.h in mlir-src/
     ${CMAKE_CURRENT_BINARY_DIR}             # For the generated .inc files
     ${CMAKE_BINARY_DIR}                     # Fallback for global generated files
+)
+
+add_executable(io-opt io-opt.cpp)
+
+target_link_libraries(io-opt PRIVATE
+  MLIRIOOptimiser
+  MLIROptLib
+  MLIRIR
+  MLIRParser
+  MLIRPass
+  MLIRTransforms
+  MLIRSupport
+  MLIRArithDialect
+  MLIRMemRefDialect
+  MLIRFuncDialect
+  MLIRLLVMDialect
 )

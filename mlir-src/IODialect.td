@@ -21,7 +21,7 @@ def IO_ReadOp : IO_Op<"read", [MemoryEffects<[MemWrite]>]> {
   let assemblyFormat = "$fd `,` $buffer `,` $size attr-dict `:` type($buffer)";
 }
 
-def IO_WriteOp : IO_Op<"write", [MemoryEffects<[MemRead]>]> {
+def IO_WriteOp : IO_Op<"write"> {
   let summary = "Basic synchronous write operation";
   let arguments = (ins Index:$fd, AnyMemRef:$buffer, Index:$size);
   let results = (outs I64:$bytes_written);
@@ -36,10 +36,9 @@ def IO_BatchReadOp : IO_Op<"batch_read", [MemoryEffects<[MemWrite]>]> {
   let assemblyFormat = "$fd `,` $buffer `,` $total_size attr-dict `:` type($buffer)";
 }
 
-def IO_BatchWriteOp : IO_Op<"batch_write", [MemoryEffects<[MemRead]>]> {
+def IO_BatchWriteOp : IO_Op<"batch_write"> {
   let summary = "Optimized batched write operation";
   let arguments = (ins Index:$fd, AnyMemRef:$buffer, Index:$total_size);
   let results = (outs I64:$bytes_written);
   let assemblyFormat = "$fd `,` $buffer `,` $total_size attr-dict `:` type($buffer)";
 }
-

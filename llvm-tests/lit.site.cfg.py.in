@@ -13,4 +13,4 @@ config.filecheck_bin = "@FILECHECK_PATH@"
 config.llvm_link_bin = "@LLVM_LINK_PATH@"
 
 # Now load the actual tool logic from the main lit.cfg.py
-lit_config.load_config(config, "@IO_SOURCE_DIR@/tests/lit.cfg.py")
+lit_config.load_config(config, "@IO_SOURCE_DIR@/llvm-tests/lit.cfg.py")

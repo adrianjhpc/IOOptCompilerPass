@@ -1,5 +1,3 @@
-//===- IOLoopBatching.cpp - MLIR High-Level I/O Optimizer -----------------===//
-
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -57,7 +55,7 @@ struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
     // Calculate Total Batch Size: TripCount * IterationSize
     Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCount, writeOp.getSize());
 
-    // Set insertion point just OUTSIDE (before) the loop
+    // Set insertion point just before the loop
     rewriter.setInsertionPoint(loop);
     
     // Create the optimized io.batch_write operation
@@ -80,8 +78,8 @@ struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
 struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IOLoopBatchingPass)
 
-  StringRef getArgument() const final { return "io-loop-batching"; }
-  StringRef getDescription() const final { return "Hoists and batches I/O operations from scf.for loops."; }
+  llvm::StringRef getArgument() const final { return "io-loop-batching"; }
+  llvm::StringRef getDescription() const final { return "Hoists and batches I/O operations from scf.for loops."; }
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
@@ -89,8 +87,8 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
 
     RewritePatternSet patterns(context);
     patterns.add<HoistIOLoopPattern>(context);
-
-    if (failed(applyPatternsAndFoldGreedily(func, std::move(patterns)))) {
+    
+    if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       signalPassFailure();
     }
   }
@@ -98,6 +96,18 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
 
 } // end anonymous namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>> createIOLoopBatchingPass() {
-  return std::make_unique<IOLoopBatchingPass>();
+namespace mlir {
+namespace io {
+
+// Expose the constructor
+std::unique_ptr<mlir::Pass> createIOLoopBatchingPass() {
+  return std::make_unique<IOLoopBatchingPass>(); 
 }
+
+// Register the pass so `io-opt` knows it exists
+void registerIOPasses() {
+  mlir::PassRegistration<IOLoopBatchingPass>();
+}
+
+} // namespace io
+} // namespace mlir

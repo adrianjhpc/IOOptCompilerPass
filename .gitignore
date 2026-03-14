@@ -5,6 +5,9 @@ tests/lit.site.cfg.py
 llvm-tests/.lit_test_times.txt
 llvm-tests/Output/
 llvm-tests/lit.site.cfg.py
+mlir-tests/.lit_test_times.txt
+mlir-tests/Output/
+mlir-tests/lit.site.cfg.py
 testing/fio-lto-optimised/
 testing/fio-lto-original/
 testing/fio-optimised/

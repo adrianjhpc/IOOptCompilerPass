@@ -55,9 +55,8 @@ if(LIT_TOOL)
         @ONLY
     )
 
-
-    # 2. Create a custom 'check' target
-    add_custom_target(check
+    # LLVM tests
+    add_custom_target(check-llvm
         # Run lit on the test/ directory, passing the -v (verbose) flag
         COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/llvm-tests
         
@@ -67,11 +66,34 @@ if(LIT_TOOL)
         DEPENDS IOOpt
         
         # Print a nice message when it starts
-        COMMENT "Running IOOptimisationPass test suite..."
+        COMMENT "Running LLVM IOOpt test suite..."
         
         # Give lit direct access to the terminal so its colored output works
         USES_TERMINAL
     )
+
+    #MLIR tests
+    configure_lit_site_cfg(
+        ${CMAKE_CURRENT_SOURCE_DIR}/mlir-tests/lit.site.cfg.py.in
+        ${CMAKE_CURRENT_BINARY_DIR}/mlir0test/lit.site.cfg.py
+    )
+
+        add_custom_target(check-mlir
+        # Run lit on the test/ directory, passing the -v (verbose) flag
+        COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/mlir-tests
+
+        # VERY IMPORTANT: Make the tests depend on the pass itself!
+        # This forces CMake to recompile IOOpt.so if you changed the C++ code
+        # before running the tests.
+        DEPENDS io-opt 
+
+        # Print a nice message when it starts
+        COMMENT "Running MLIR IOOpt test suite..."
+
+        # Give lit direct access to the terminal so its colored output works
+        USES_TERMINAL
+    )
+
 else()
     message(WARNING "Could not find the 'lit' tool. The 'make check' target will not be created.")
     message(WARNING "You can install it via: pip install lit")
