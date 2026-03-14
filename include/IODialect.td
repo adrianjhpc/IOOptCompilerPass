@@ -42,3 +42,4 @@ def IO_BatchWriteOp : IO_Op<"batch_write", [MemoryEffects<[MemRead]>]> {
   let results = (outs I64:$bytes_written);
   let assemblyFormat = "$fd `,` $buffer `,` $total_size attr-dict `:` type($buffer)";
 }
+
