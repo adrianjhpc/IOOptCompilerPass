@@ -1,5 +1,7 @@
 #include "IODialect.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/Builders.h"
+
 using namespace mlir;
 using namespace mlir::io;
 
