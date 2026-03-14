@@ -2,8 +2,16 @@ build
 tests/Output
 tests/.lit_test_times.txt
 tests/lit.site.cfg.py
+llvm-tests/.lit_test_times.txt
+llvm-tests/Output/
+llvm-tests/lit.site.cfg.py
+testing/fio-lto-optimised/
+testing/fio-lto-original/
+testing/fio-optimised/
+testing/fio-original/
 testing/postgres_original
 testing/postgres_lto_original
 testing/postgres_optimised
 testing/postgres_lto_optimised
+testing/postgresql-*
 *~
