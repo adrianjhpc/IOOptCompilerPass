@@ -5,17 +5,135 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+
 #include "IODialect.h"
 
 using namespace mlir;
 
 namespace {
 
-/// PASS 1: Loop I/O Pattern Recognition
-/// Transforms loops with repeated I/O operations into batched operations.
-/// 
-/// Before: scf.for %i = %zero to %ten { io.write(%fd, %buffer, %one) }
-/// After:  io.batch_write(%fd, %buffer, %ten)
+// Helper to extract a constant integer from an MLIR Value
+static std::optional<int64_t> getConstantIntValue(Value val) {
+    if (auto constOp = val.getDefiningOp<arith::ConstantIndexOp>())
+        return constOp.value();
+    if (auto constIntOp = val.getDefiningOp<arith::ConstantIntOp>())
+        return constIntOp.value();
+    return std::nullopt;
+}
+
+// Proves that: (Offset_Multiplier * Loop_Step) == Write_Size
+static bool verifySCEVOffset(Value dynamicOffset, scf::ForOp loop, Value writeSize) {
+    Value iv = loop.getInductionVar();
+    
+    // Attempt to resolve the writeSize and step to compile-time constants
+    auto optWriteSize = getConstantIntValue(writeSize);
+    auto optStep = getConstantIntValue(loop.getStep());
+    
+    // If we can't statically prove the step and size, it is too dangerous to 
+    // batch contiguously. Conservatively abort.
+    if (!optWriteSize || !optStep) return false;
+    
+    int64_t targetAdvance = *optWriteSize;
+    int64_t step = *optStep;
+
+    // Case 1: The offset IS the induction variable (Multiplier = 1)
+    // Example: ptr = base + iv. 
+    // This is only contiguous if the loop step exactly matches the write size.
+    if (dynamicOffset == iv) {
+        return step == targetAdvance;
+    }
+
+    // Case 2: The offset is explicitly calculated: offset = iv * multiplier
+    if (auto mulOp = dynamicOffset.getDefiningOp<arith::MulIOp>()) {
+        Value lhs = mulOp.getLhs();
+        Value rhs = mulOp.getRhs();
+
+        if (lhs == iv || rhs == iv) {
+            Value multiplierVal = (lhs == iv) ? rhs : lhs;
+            auto optMultiplier = getConstantIntValue(multiplierVal);
+            
+            if (optMultiplier) {
+                return (*optMultiplier * step) == targetAdvance;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool isContiguousMemoryAccess(Value buffer, scf::ForOp loop, Value writeSize, Value &outBasePointer) {
+    // If the buffer doesn't change during the loop, it's writing to the exact 
+    // same memory address every iteration. This is not contiguous batchable.
+    if (loop.isDefinedOutsideOfLoop(buffer)) return false;
+
+    Operation *defOp = buffer.getDefiningOp();
+    if (!defOp) return false;
+
+    // ------------------------------------------------------------------
+    // PATTERN 1: mlir::memref::SubViewOp
+    // Example: %sub = memref.subview %base[%iv] [%size] [%stride]
+    // ------------------------------------------------------------------
+    if (auto subviewOp = dyn_cast<memref::SubViewOp>(defOp)) {
+        outBasePointer = subviewOp.getSource();
+        
+        // Base pointer must live outside the loop
+        if (!loop.isDefinedOutsideOfLoop(outBasePointer)) return false;
+
+        // Subviews have dynamic offsets. We need to check if the offset 
+        // scales correctly with the induction variable.
+        auto dynamicOffsets = subviewOp.getDynamicOffsets();
+        if (dynamicOffsets.empty()) return false; // Static offset = same address
+
+        // For 1D subviews, check the first dynamic offset
+        return verifySCEVOffset(dynamicOffsets.front(), loop, writeSize);
+    }
+
+    // ------------------------------------------------------------------
+    // PATTERN 2: mlir::LLVM::GEPOp (GetElementPtr)
+    // Example: %ptr = llvm.getelementptr %base[%iv]
+    // ------------------------------------------------------------------
+    if (auto gepOp = dyn_cast<LLVM::GEPOp>(defOp)) {
+        outBasePointer = gepOp.getBase();
+        
+        if (!loop.isDefinedOutsideOfLoop(outBasePointer)) return false;
+
+        // GEPs separate static and dynamic indices.
+        auto dynamicIndices = gepOp.getDynamicIndices();
+        if (dynamicIndices.empty()) return false;
+
+        // Check the primary dynamic index advancing the pointer
+        return verifySCEVOffset(dynamicIndices.back(), loop, writeSize);
+    }
+
+    // ------------------------------------------------------------------
+    // PATTERN 3: Raw arith.addi Pointer Math
+    // Example: %ptr = arith.addi %base, %offset
+    // ------------------------------------------------------------------
+    if (auto addOp = dyn_cast<arith::AddIOp>(defOp)) {
+        Value lhs = addOp.getLhs();
+        Value rhs = addOp.getRhs();
+
+        Value dynamicOffset;
+        if (loop.isDefinedOutsideOfLoop(lhs)) {
+            outBasePointer = lhs;
+            dynamicOffset = rhs;
+        } else if (loop.isDefinedOutsideOfLoop(rhs)) {
+            outBasePointer = rhs;
+            dynamicOffset = lhs;
+        } else {
+            return false; // Neither side is a stable base pointer
+        }
+
+        return verifySCEVOffset(dynamicOffset, loop, writeSize);
+    }
+
+    // Unrecognized memory access pattern
+    return false;
+}
+
 struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
@@ -40,10 +158,17 @@ struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
 
     if (hasSideEffects || !writeOp) return failure();
 
-    // Validate that the File Descriptor and Buffer exist outside the loop
-    if (!loop.isDefinedOutsideOfLoop(writeOp.getFd()) ||
-        !loop.isDefinedOutsideOfLoop(writeOp.getBuffer())) {
+    // Verify FD is stable
+    if (!loop.isDefinedOutsideOfLoop(writeOp.getFd())) {
       return failure();
+    }
+
+    // Verify Memory Access is Contiguous and extract the stable Base Pointer
+    Value basePointer;
+    if (!isContiguousMemoryAccess(writeOp.getBuffer(), loop, writeOp.getSize(), basePointer)) {
+        // If it's not contiguous, we abort the batching 
+        // (This prevents silent memory corruption)
+        return failure();
     }
 
     Location loc = loop.getLoc();
@@ -58,12 +183,13 @@ struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
     // Set insertion point just before the loop
     rewriter.setInsertionPoint(loop);
     
-    // Create the optimized io.batch_write operation
+    // Create the optimized io.batch_write operation using the base pointer, 
+    // not the loop-variant buffer pointer!
     rewriter.create<io::BatchWriteOp>(
         loc, 
         rewriter.getI64Type(), 
         writeOp.getFd(), 
-        writeOp.getBuffer(), 
+        basePointer, 
         totalSize
     );
 
