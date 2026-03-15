@@ -21,7 +21,8 @@ add_public_tablegen_target(IODialectIncGen)
 add_library(MLIRIOOptimiser
   IODialect.cpp 
   IOLoopBatching.cpp
-  IOLoweringToLLVM.cpp)
+  IOLoweringToLLVM.cpp
+  IORecognition.cpp)
 
 # Ensure TableGen runs BEFORE trying to compile the C++ files
 add_dependencies(MLIRIOOptimiser IODialectIncGen)
