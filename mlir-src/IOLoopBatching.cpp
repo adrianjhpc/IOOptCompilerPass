@@ -145,6 +145,7 @@ static bool isContiguousMemoryAccess(Value buffer, scf::ForOp loop, Value writeS
     return false;
 }
 
+
 struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
@@ -155,56 +156,72 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
     io::WriteOp writeOp = nullptr;
     bool hasSideEffects = false;
 
-    // Detect if this loop is a pure I/O loop
+    // Detect if this is a pure I/O loop
     for (Operation &op : *body) {
       if (isa<scf::YieldOp>(op)) continue; 
 
       if (auto ioWrite = dyn_cast<io::WriteOp>(op)) {
-        if (writeOp) { hasSideEffects = true; break; } // Abort if complex multi-write
+        if (writeOp) { hasSideEffects = true; break; }
         writeOp = ioWrite;
       } else if (!isMemoryEffectFree(&op)) {
-        hasSideEffects = true; break; // Abort if there are unknown side-effects
+        hasSideEffects = true; break; 
       }
     }
 
     if (hasSideEffects || !writeOp) return failure();
-
-    // Verify FD is stable
-    if (!loop.isDefinedOutsideOfLoop(writeOp.getFd())) {
-      return failure();
-    }
-
-    // Verify Memory Access is Contiguous and extract the stable Base Pointer
-    Value basePointer;
-    if (!isContiguousMemoryAccess(writeOp.getBuffer(), loop, writeOp.getSize(), basePointer)) {
-        // If it's not contiguous, we abort the batching 
-        // (This prevents silent memory corruption)
-        return failure();
-    }
+    if (!loop.isDefinedOutsideOfLoop(writeOp.getFd())) return failure();
 
     Location loc = loop.getLoc();
-    
-    // Mathematically calculate Trip Count: (UpperBound - LowerBound) / Step
     Value diff = rewriter.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
     Value tripCount = rewriter.create<arith::DivSIOp>(loc, diff, loop.getStep());
 
-    // Calculate Total Batch Size: TripCount * IterationSize
-    Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCount, writeOp.getSize());
-
-    // Set insertion point just before the loop
     rewriter.setInsertionPoint(loop);
-    
-    // Create the optimized io.batch_write operation using the base pointer, 
-    // not the loop-variant buffer pointer!
-    rewriter.create<io::BatchWriteOp>(
-        loc, 
-        rewriter.getI64Type(), 
-        writeOp.getFd(), 
-        basePointer, 
-        totalSize
-    );
 
-    // Completely erase the original loop
+    // Contiguous vs Vector Routing
+    Value basePointer;
+    if (isContiguousMemoryAccess(writeOp.getBuffer(), loop, writeOp.getSize(), basePointer)) {
+        // Contigious writes
+        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCount, writeOp.getSize());
+        rewriter.create<io::BatchWriteOp>(loc, rewriter.getI64Type(), writeOp.getFd(), basePointer, totalSize);
+    } else {
+        // Fallback to scattered writes (writev) 
+        Value tripCountIndex = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), tripCount);
+
+        auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, LLVM::LLVMPointerType::get(getContext()));
+        auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
+        
+        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCountIndex);
+        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCountIndex);
+
+        // Build a new loop just to calculate the addresses
+        auto calcLoop = rewriter.create<scf::ForOp>(loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
+        rewriter.setInsertionPointToStart(calcLoop.getBody());
+
+        Value currentIV = calcLoop.getInductionVar();
+        Value ivOffset = rewriter.create<arith::SubIOp>(loc, currentIV, loop.getLowerBound());
+        Value arrayIdx = rewriter.create<arith::DivSIOp>(loc, ivOffset, loop.getStep());
+        Value arrayIdxCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), arrayIdx);
+
+        // Clone the address calculations
+        IRMapping mapping;
+        mapping.map(loop.getInductionVar(), currentIV);
+        for (Operation &op : *body) {
+            if (isa<io::WriteOp, scf::YieldOp>(op)) continue;
+            rewriter.clone(op, mapping);
+        }
+
+        Value mappedBuffer = mapping.lookupOrDefault(writeOp.getBuffer());
+        Value mappedSize = mapping.lookupOrDefault(writeOp.getSize());
+        
+        rewriter.create<memref::StoreOp>(loc, mappedBuffer, ptrsMemref, arrayIdxCast);
+        rewriter.create<memref::StoreOp>(loc, mappedSize, sizesMemref, arrayIdxCast);
+
+        // Emit the batched scatter operation after the calculation loop
+        rewriter.setInsertionPointAfter(calcLoop);
+        rewriter.create<io::BatchWriteVOp>(loc, writeOp.getFd(), ptrsMemref, sizesMemref, tripCount);
+    }
+
+    // Completely erase the original write loop
     rewriter.eraseOp(loop);
 
     return success();
@@ -333,13 +350,16 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
   llvm::StringRef getArgument() const final { return "io-loop-batching"; }
   llvm::StringRef getDescription() const final { return "Hoists and batches I/O operations from scf.for loops."; }
 
+
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     MLIRContext *context = &getContext();
 
+    AliasAnalysis &aliasAnalysis = getAnalysis<AliasAnalysis>();
+
     RewritePatternSet patterns(context);
     patterns.add<HoistWriteLoopPattern>(context);
-    patterns.add<HoistReadLoopPattern>(context);    
+    patterns.add<HoistReadLoopPattern>(context, aliasAnalysis);  
  
     if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       signalPassFailure();
