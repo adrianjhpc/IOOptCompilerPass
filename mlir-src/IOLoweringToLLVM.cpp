@@ -34,9 +34,15 @@ struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
     // Cast the MLIR types down to raw LLVM types
     Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
 
-    // Extract the raw pointer from the MLIR MemRef descriptor
-    auto memrefType = mlir::cast<MemRefType>(op.getBuffer().getType());
-    Value rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
+    // Safely handle both MemRefs and raw LLVM Pointers
+    Value rawPtr;
+    if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
+        // It's a MemRef descriptor: extract the raw contiguous pointer
+        rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
+    } else {
+        // It's already a raw pointer (from C/C++ frontend)
+        rawPtr = adaptor.getBuffer();
+    }
 
     // Emit the actual LLVM IR Call instruction
     auto llvmCall = rewriter.create<LLVM::CallOp>(
@@ -152,8 +158,15 @@ struct BatchReadLowering : public ConvertOpToLLVMPattern<io::BatchReadOp> {
 
     Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
 
-    auto memrefType = mlir::cast<MemRefType>(op.getBuffer().getType());
-    Value rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
+    // Safely handle both MemRefs and raw LLVM Pointers
+    Value rawPtr;
+    if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
+        // It's a MemRef descriptor: extract the raw contiguous pointer
+        rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
+    } else {
+        // It's already a raw pointer (from C/C++ frontend)
+        rawPtr = adaptor.getBuffer();
+    }
 
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         op.getLoc(),
@@ -257,6 +270,7 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
   // Tell MLIR that this pass generates LLVM dialect operations
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<LLVM::LLVMDialect>();
+    registry.insert<scf::SCFDialect>();
   }
 
   void runOnOperation() override {
