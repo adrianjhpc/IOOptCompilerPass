@@ -86,10 +86,10 @@ struct BatchWriteVLowering : public ConvertOpToLLVMPattern<io::BatchWriteVOp> {
         loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
     // Extract the raw contiguous base pointers from the lowered MemRef descriptors
-    auto ptrsMemRefTy = cast<MemRefType>(op.Ptrs().getType());
-    auto sizesMemRefTy = cast<MemRefType>(op.Sizes().getType());
-    Value ptrsRaw = getStridedElementPtr(loc, ptrsMemRefTy, adaptor.Ptrs(), {}, rewriter);
-    Value sizesRaw = getStridedElementPtr(loc, sizesMemRefTy, adaptor.Sizes(), {}, rewriter);
+    auto ptrsMemRefTy = cast<MemRefType>(op.getPtrs().getType());
+    auto sizesMemRefTy = cast<MemRefType>(op.getSizes().getType());
+    Value ptrsRaw = getStridedElementPtr(loc, ptrsMemRefTy, adaptor.getPtrs(), {}, rewriter);
+    Value sizesRaw = getStridedElementPtr(loc, sizesMemRefTy, adaptor.getSizes(), {}, rewriter);
 
     // Generate a loop to populate the iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -210,10 +210,10 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
         loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
     // Extract the raw contiguous base pointers from the lowered MemRef descriptors
-    auto ptrsMemRefTy = cast<MemRefType>(op.Ptrs().getType());
-    auto sizesMemRefTy = cast<MemRefType>(op.Sizes().getType());
-    Value ptrsRaw = getStridedElementPtr(loc, ptrsMemRefTy, adaptor.Ptrs(), {}, rewriter);
-    Value sizesRaw = getStridedElementPtr(loc, sizesMemRefTy, adaptor.Sizes(), {}, rewriter);
+    auto ptrsMemRefTy = cast<MemRefType>(op.getPtrs().getType());
+    auto sizesMemRefTy = cast<MemRefType>(op.getSizes().getType());
+    Value ptrsRaw = getStridedElementPtr(loc, ptrsMemRefTy, adaptor.getPtrs(), {}, rewriter);
+    Value sizesRaw = getStridedElementPtr(loc, sizesMemRefTy, adaptor.getSizes(), {}, rewriter);
 
     // Generate an SCF loop to populate the iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
