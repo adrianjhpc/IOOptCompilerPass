@@ -174,6 +174,7 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
     Location loc = loop.getLoc();
     Value diff = rewriter.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
     Value tripCount = rewriter.create<arith::DivSIOp>(loc, diff, loop.getStep());
+    Value tripCountI64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), tripCount);
 
     rewriter.setInsertionPoint(loop);
 
@@ -181,17 +182,15 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
     Value basePointer;
     if (isContiguousMemoryAccess(writeOp.getBuffer(), loop, writeOp.getSize(), basePointer)) {
         // Contigious writes
-        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCount, writeOp.getSize());
+        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCountI64, writeOp.getSize());
         rewriter.create<io::BatchWriteOp>(loc, rewriter.getI64Type(), writeOp.getFd(), basePointer, totalSize);
     } else {
         // Fallback to scattered writes (writev) 
-        Value tripCountIndex = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), tripCount);
-
         auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, LLVM::LLVMPointerType::get(getContext()));
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
         
-        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCountIndex);
-        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCountIndex);
+        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
+        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCount);
 
         // Build a new loop just to calculate the addresses
         auto calcLoop = rewriter.create<scf::ForOp>(loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
@@ -284,6 +283,7 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
     Location loc = loop.getLoc();
     Value diff = rewriter.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
     Value tripCount = rewriter.create<arith::DivSIOp>(loc, diff, loop.getStep());
+    Value tripCountI64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), tripCount);
 
     rewriter.setInsertionPoint(loop);
 
@@ -291,17 +291,16 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
     Value basePointer;
     if (isContiguousMemoryAccess(readOp.getBuffer(), loop, readOp.getSize(), basePointer)) {
         // Fast contigious read
-        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCount, readOp.getSize());
+        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCountI64, readOp.getSize());
         rewriter.create<io::BatchReadOp>(loc, rewriter.getI64Type(), readOp.getFd(), basePointer, totalSize);
     } else {
         // Gather (readv)
-        Value tripCountIndex = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), tripCount);
-
         auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, LLVM::LLVMPointerType::get(getContext()));
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
-        
-        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCountIndex);
-        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCountIndex);
+
+        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
+        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCount);
+
 
         // Build an address-calculation loop before the main loop
         auto calcLoop = rewriter.create<scf::ForOp>(loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
