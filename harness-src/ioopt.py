@@ -3,14 +3,16 @@ import sys
 import os
 import subprocess
 import argparse
+import re
 
 TOOLCHAIN_DIR = "../build/mlir-src/"
 LIB_DIR = "../build/llvm-src/"
 
 CLANG = "clang++"
 IO_OPT = os.path.join(TOOLCHAIN_DIR, "io-opt")
-MLIR_TRANSLATE = os.path.join(TOOLCHAIN_DIR, "mlir-translate")
+MLIR_TRANSLATE = "mlir-translate"
 OPT = "opt"
+CIR_OPT = "cir-opt"
 LLVM_LINK = "llvm-link"
 
 LLVM_PLUGIN = os.path.join(LIB_DIR, "IOOpt.so")
@@ -25,32 +27,80 @@ def run_cmd(cmd, step_name):
         sys.exit(result.returncode)
 
 def compile_to_bitcode(source_file, output_bc, flags):
-    """Stage 1: Source -> MLIR -> LLVM IR -> LLVM Bitcode"""
+    """Stage 1: Source -> CIR -> Std MLIR -> IO Opt -> LLVM Dialect -> LLVM IR -> LLVM Bitcode"""
     base = os.path.splitext(source_file)[0]
-    mlir_file = f"{base}.mlir"
+    cir_mlir_file = f"{base}_cir.mlir"
+    std_mlir_file = f"{base}_std.mlir"
     opt_mlir_file = f"{base}_opt.mlir"
+    llvm_dialect_file = f"{base}_llvm.mlir"
     ll_file = f"{base}.ll"
 
-    # Frontend: C++ to ClangIR/MLIR
-    run_cmd([CLANG, "-fclangir", "-emit-mlir", source_file, "-o", mlir_file] + flags, 
-            f"Frontend (Source code to MLIR) for {source_file}")
+    # Frontend: C++ to ClangIR
+    run_cmd([CLANG, "-fclangir", "-emit-mlir", source_file, "-o", cir_mlir_file] + flags, 
+            f"Frontend (Source code to CIR) for {source_file}")
 
-    # MLIR Pass: io-opt
-    run_cmd([IO_OPT, mlir_file, "--convert-cir-to-io", "--io-batch-merge", 
-             "--convert-io-to-llvm", "-o", opt_mlir_file], 
+    # Lowering CIR to Standard MLIR
+    run_cmd([CIR_OPT, cir_mlir_file, "--cir-to-mlir", "-o", std_mlir_file], 
+            f"Lowering CIR to Standard MLIR")
+
+    # MLIR Pass: io-opt (our custom MLIR)
+    run_cmd([IO_OPT, std_mlir_file, 
+             "--allow-unregistered-dialect", 
+             "--recognise-io", "--io-loop-batching", "--convert-io-to-llvm", 
+             "-o", opt_mlir_file], 
             f"MLIR Optimisation (io-opt)")
 
-    # Translate: MLIR to LLVM IR
-    run_cmd([MLIR_TRANSLATE, "--mlir-to-llvmir", opt_mlir_file, "-o", ll_file], 
+    # Bridge: Standard MLIR to LLVM Dialect
+    # This lowers scf, func, and memref to LLVM, and strips CIR metadata
+    run_cmd([CIR_OPT, opt_mlir_file, 
+             "--cir-mlir-to-llvm", 
+             "-o", llvm_dialect_file], 
+            f"Lowering to LLVM Dialect")
+
+    with open(llvm_dialect_file, "r") as f:
+        mlir_data = f.read()
+    
+    import re
+    # 1. Erase global alias definitions for #cir and #fn_attr
+    mlir_data = re.sub(r'^#(cir|fn_attr).*?\n', '', mlir_data, flags=re.MULTILINE)
+    
+    # 2. Erase CIR attributes that use angled brackets
+    mlir_data = re.sub(r'cir\.[a-zA-Z0-9_]+\s*=\s*#[a-zA-Z0-9_.]+<[^>]*>', '', mlir_data)
+    
+    # 3. Erase CIR attributes that use square arrays
+    mlir_data = re.sub(r'cir\.[a-zA-Z0-9_]+\s*=\s*\[[^\]]*\]', '', mlir_data)
+    
+    # 4. Erase any remaining simple CIR attributes
+    mlir_data = re.sub(r'cir\.[a-zA-Z0-9_]+\s*=\s*[^,}\n]+', '', mlir_data)
+    
+    # 5. Erase specific ClangIR C++ metadata leaking into standard attributes
+    mlir_data = re.sub(r'cxx_special_member\s*=\s*#[a-zA-Z0-9_.]+<[^>]*>', '', mlir_data)
+    mlir_data = re.sub(r'global_visibility\s*=\s*#[a-zA-Z0-9_.]+<[^>]*>', '', mlir_data)
+    
+    # 6. Cleanup the broken commas left behind (THE FIX)
+    prev_len = 0
+    while len(mlir_data) != prev_len:
+        prev_len = len(mlir_data)
+        mlir_data = re.sub(r',\s*,', ',', mlir_data) # Collapse multi-commas
+        
+    mlir_data = re.sub(r'{\s*,', '{', mlir_data)     # Drop comma after {
+    mlir_data = re.sub(r',\s*}', '}', mlir_data)     # Drop comma before }
+    mlir_data = mlir_data.replace('attributes { }', '').replace('attributes {}', '')
+
+    with open(llvm_dialect_file, "w") as f:
+        f.write(mlir_data)
+
+    # Translate: Pure LLVM Dialect to LLVM IR
+    run_cmd([MLIR_TRANSLATE, "--mlir-to-llvmir", llvm_dialect_file, "-o", ll_file], 
             f"Translation to LLVM IR")
 
     # LLVM Pass (Compile-Time) & Emit Bitcode
-    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, "-passes=io-cleanup,default<O2>", 
+    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, "-passes=function(io-opt),default<O2>", 
              ll_file, "-o", output_bc], 
             f"LLVM Compile-Time Optimisation")
 
     # Cleanup intermediate files
-    for f in [mlir_file, opt_mlir_file, ll_file]:
+    for f in [cir_mlir_file, std_mlir_file, opt_mlir_file, llvm_dialect_file, ll_file]:
         if os.path.exists(f): os.remove(f)
 
 def link_with_lto(input_bcs, output_bin, flags):
@@ -59,17 +109,18 @@ def link_with_lto(input_bcs, output_bin, flags):
     lto_opt_bc = "merged_opt.bc"
 
     #  Merge all bitcode files together (The LTO Link step)
-    run_cmd([LLVM_LINK] + input_bcs + ["-o", merged_bc], 
+    run_cmd([LLVM_LINK] + input_bcs + ["-o", merged_bc],
             "Merging Bitcode (llvm-link)")
 
     # Run the LLVM Pass across the entire merged program
     # This allows interprocedural LLVM optimisations across different .cpp files
-    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, "-passes=io-lto-merge,default<O3>", 
-             merged_bc, "-o", lto_opt_bc], 
+    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, 
+             "-passes=io-lto-merge,default<O3>", 
+             merged_bc, "-o", lto_opt_bc],      
             "LLVM Link-Time Optimisation (LTO)")
 
     # Final Machine Code Generation & Native Linking
-    run_cmd([CLANG, lto_opt_bc, "-o", output_bin, f"-L{LIB_DIR}", RUNTIME_LIB] + flags, 
+    run_cmd([CLANG, lto_opt_bc, "-o", output_bin] + flags,
             "Final Code Generation & Linking")
 
     # Cleanup

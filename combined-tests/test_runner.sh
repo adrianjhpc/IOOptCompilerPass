@@ -17,11 +17,6 @@ echo "[*] Verifying MLIR Loop Batching translated to LLVM IR..."
 # Disassemble the bitcode to readable LLVM IR and check for the vectorized writev
 llvm-dis end_to_end_main.bc -o - | FileCheck --check-prefix=CHECK-MLIR end_to_end_main.cpp
 
-cat << 'EOF' > mlir_check.rules
-CHECK-MLIR-NOT: call i64 @write(
-CHECK-MLIR: call i64 @writev(
-EOF
-llvm-dis end_to_end_main.bc -o - | FileCheck mlir_check.rules
 echo "[PASS] MLIR successfully batched the loop into writev!"
 
 
@@ -46,7 +41,7 @@ else
 fi
 
 # Cleanup
-rm -f end_to_end_main.bc test_app output_test.txt mlir_check.rules
+rm -f end_to_end_main.bc end_to_end_lib.bc  output_test.txt mlir_check.rules
 echo "==========================================================="
 echo " All End-to-End Tests Passed!"
 echo "==========================================================="
