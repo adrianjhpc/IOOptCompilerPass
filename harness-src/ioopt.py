@@ -36,14 +36,22 @@ def compile_to_bitcode(source_file, output_bc, flags):
     ll_file = f"{base}.ll"
 
     # Frontend: C++ to ClangIR
-    run_cmd([CLANG, "-fclangir", "-emit-mlir", source_file, "-o", cir_mlir_file] + flags, 
+    run_cmd([CLANG, "-fclangir", "-emit-mlir", source_file, "-o", cir_mlir_file, "-O3"] + flags, 
             f"Frontend (Source code to CIR) for {source_file}")
 
     # Lowering CIR to Standard MLIR
     run_cmd([CIR_OPT, cir_mlir_file, "--cir-to-mlir", "-o", std_mlir_file], 
             f"Lowering CIR to Standard MLIR")
 
-    # MLIR Pass: io-opt (our custom MLIR)
+    # Clean up
+    # mem2reg: Promotes stack memory (alloca) to SSA registers
+    # canonicalize: Folds the resulting branches into pure scf.for loops
+    run_cmd([CIR_OPT, std_mlir_file, 
+             "--pass-pipeline=builtin.module(func.func(mem2reg,canonicalize))", 
+             "-o", std_mlir_file], 
+            f"MLIR Cleanup (mem2reg & canonicalize)")
+
+    # MLIR Pass: io-opt (our custom optimisations)
     run_cmd([IO_OPT, std_mlir_file, 
              "--allow-unregistered-dialect", 
              "--recognise-io", "--io-loop-batching", "--convert-io-to-llvm", 
@@ -95,13 +103,13 @@ def compile_to_bitcode(source_file, output_bc, flags):
             f"Translation to LLVM IR")
 
     # LLVM Pass (Compile-Time) & Emit Bitcode
-    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, "-passes=function(io-opt),default<O2>", 
+    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, "-passes=function(io-opt),default<O1>", 
              ll_file, "-o", output_bc], 
             f"LLVM Compile-Time Optimisation")
 
     # Cleanup intermediate files
-    for f in [cir_mlir_file, std_mlir_file, opt_mlir_file, llvm_dialect_file, ll_file]:
-        if os.path.exists(f): os.remove(f)
+#    for f in [cir_mlir_file, std_mlir_file, opt_mlir_file, llvm_dialect_file, ll_file]:
+#        if os.path.exists(f): os.remove(f)
 
 def link_with_lto(input_bcs, output_bin, flags):
     """Stage 2: Link Bitcode -> LTO LLVM Pass -> Executable"""
@@ -115,7 +123,7 @@ def link_with_lto(input_bcs, output_bin, flags):
     # Run the LLVM Pass across the entire merged program
     # This allows interprocedural LLVM optimisations across different .cpp files
     run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, 
-             "-passes=io-lto-merge,default<O3>", 
+             "-passes=io-lto-merge,default<O1>", 
              merged_bc, "-o", lto_opt_bc],      
             "LLVM Link-Time Optimisation (LTO)")
 

@@ -8,6 +8,7 @@
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
 
 #include "IODialect.h"
 

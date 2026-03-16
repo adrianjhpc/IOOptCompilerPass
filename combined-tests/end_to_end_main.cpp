@@ -12,9 +12,9 @@ int main() {
     char buffer[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
     // MLIR Test: Strided Loop Batching
-    #pragma clang loop unroll(disable) vectorize(disable)
-    for (int i = 0; i < 10; i += 2) {
-        write(fd, &buffer[i], 1);
+    //#pragma clang loop unroll(disable) vectorize(disable)
+    for (int i = 0; i < 1000; i += 2) {
+        write(fd, &buffer[0], 32); // use modulo so we don't read out of bounds
     }
 
     // ClangIR emits memory-backed control flow (allocas/branches) for C++ loops.

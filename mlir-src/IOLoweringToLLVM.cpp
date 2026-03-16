@@ -294,13 +294,13 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
     target.addIllegalOp<io::BatchWriteOp>();
     target.addIllegalOp<io::BatchWriteVOp>();
     target.addIllegalOp<io::BatchReadOp>();
-    target.addIllegalOp<io::BatchReadVOp>(); // NEW: Ensure this gets eliminated!
+    target.addIllegalOp<io::BatchReadVOp>();
 
     RewritePatternSet patterns(context);
     patterns.add<BatchWriteLowering>(typeConverter);
     patterns.add<BatchWriteVLowering>(typeConverter);
     patterns.add<BatchReadLowering>(typeConverter);
-    patterns.add<BatchReadVLowering>(typeConverter); // NEW: Register the Vector lowering
+    patterns.add<BatchReadVLowering>(typeConverter); 
 
     // Apply the conversion to the module
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
