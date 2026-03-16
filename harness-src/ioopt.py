@@ -33,6 +33,9 @@ def compile_to_bitcode(source_file, output_bc, flags):
     std_mlir_file = f"{base}_std.mlir"
     opt_mlir_file = f"{base}_opt.mlir"
     llvm_dialect_file = f"{base}_llvm.mlir"
+    llvm_dialect_dirty_file = f"{base}_llvm_dirty.mlir"
+    llvm_dialect_clean_file = f"{base}_llvm_clean.mlir"
+
     ll_file = f"{base}.ll"
 
     # Frontend: C++ to ClangIR
@@ -62,7 +65,7 @@ def compile_to_bitcode(source_file, output_bc, flags):
     # This lowers scf, func, and memref to LLVM, and strips CIR metadata
     run_cmd([CIR_OPT, opt_mlir_file, 
              "--cir-mlir-to-llvm", 
-             "-o", llvm_dialect_file], 
+             "-o", llvm_dialect_dirty_file], 
             f"Lowering to LLVM Dialect")
 
     # Tidy up the CIR output
@@ -70,7 +73,7 @@ def compile_to_bitcode(source_file, output_bc, flags):
             f"Stripping ClangIR Attributes")
 
     # Translate: Pure LLVM Dialect to LLVM IR
-    run_cmd([MLIR_TRANSLATE, "--mlir-to-llvmir", llvm_dialect_file, "-o", ll_file], 
+    run_cmd([MLIR_TRANSLATE, llvm_dialect_clean_file, "--mlir-to-llvmir", "-o", ll_file], 
             f"Translation to LLVM IR")
 
     # LLVM Pass (Compile-Time) & Emit Bitcode
@@ -79,7 +82,7 @@ def compile_to_bitcode(source_file, output_bc, flags):
             f"LLVM Compile-Time Optimisation")
 
     # Cleanup intermediate files
-#    for f in [cir_mlir_file, std_mlir_file, opt_mlir_file, llvm_dialect_file, ll_file]:
+#    for f in [cir_mlir_file, std_mlir_file, opt_mlir_file, llvm_dialect_file, llvm_dialect_dirty_file, llvm_dialect_clean_file, ll_file]:
 #        if os.path.exists(f): os.remove(f)
 
 def link_with_lto(input_bcs, output_bin, flags):
