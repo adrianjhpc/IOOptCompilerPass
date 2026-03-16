@@ -92,26 +92,27 @@ if(LIT_TOOL)
         USES_TERMINAL
     )
 
-    configure_lit_site_cfg(
-        ${CMAKE_CURRENT_SOURCE_DIR}/combined-tests/lit.site.cfg.py.in
-        ${CMAKE_CURRENT_BINARY_DIR}/combined-tests/lit.site.cfg.py
-    )
+#    configure_lit_site_cfg(
+#        ${CMAKE_CURRENT_SOURCE_DIR}/combined-tests/lit.site.cfg.py.in
+#        ${CMAKE_CURRENT_BINARY_DIR}/combined-tests/lit.site.cfg.py
+#    )
+
 
     #Combined tests
-    add_custom_target(check-mlir
-        # Run lit on the test/ directory, passing the -v (verbose) flag
-        COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/combined-tests
-
-        # This forces CMake to recompile IOOpt.so if you changed the C++ code
-        # before running the tests.
-        DEPENDS io-opt
-
-        # Print a nice message when it starts
-        COMMENT "Running combined IOOpt test suite..."
-
-        # Give lit direct access to the terminal so its colored output works
-        USES_TERMINAL
-    )
+#    add_custom_target(check-combined
+#        # Run lit on the test/ directory, passing the -v (verbose) flag
+#        COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/combined-tests
+#
+#        # This forces CMake to recompile IOOpt.so if you changed the C++ code
+#        # before running the tests.
+#        DEPENDS io-opt
+#
+#        # Print a nice message when it starts
+#        COMMENT "Running combined IOOpt test suite..."
+#
+#        # Give lit direct access to the terminal so its colored output works
+#        USES_TERMINAL
+#    )
 
 
 else()

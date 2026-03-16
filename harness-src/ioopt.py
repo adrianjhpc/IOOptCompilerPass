@@ -4,8 +4,8 @@ import os
 import subprocess
 import argparse
 
-TOOLCHAIN_DIR = "./bin"
-LIB_DIR = "./lib"
+TOOLCHAIN_DIR = "../build/mlir-src/"
+LIB_DIR = "../build/llvm-src/"
 
 CLANG = "clang++"
 IO_OPT = os.path.join(TOOLCHAIN_DIR, "io-opt")
