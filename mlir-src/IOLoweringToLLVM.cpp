@@ -188,38 +188,33 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     auto module = op->getParentOfType<ModuleOp>();
     MLIRContext *ctx = rewriter.getContext();
 
-    // Define the LLVM Types for `struct iovec { void *iov_base; size_t iov_len; }`
+    // 1. Define LLVM Types (iovec { void*, size_t })
     Type voidPtrTy = LLVM::LLVMPointerType::get(ctx);
     Type sizeTy = rewriter.getI64Type();
+    Type i32Ty = rewriter.getI32Type();
     Type iovecTy = LLVM::LLVMStructType::getLiteral(ctx, {voidPtrTy, sizeTy});
 
-    // Ensure the OS `readv` function is declared in the module
-    // ssize_t readv(int fd, const struct iovec *iov, int iovcnt);
+    // 2. Ensure `readv` is declared (ssize_t readv(int fd, const struct iovec *iov, int iovcnt))
     auto readvFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("readv");
     if (!readvFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(module.getBody());
-      auto readvType = LLVM::LLVMFunctionType::get(
-          sizeTy, {rewriter.getI32Type(), voidPtrTy, rewriter.getI32Type()});
-      readvFunc = LLVM::LLVMFuncOp::create(rewriter, loc, "readv", readvType);
-
+      auto readvType = LLVM::LLVMFunctionType::get(sizeTy, {i32Ty, voidPtrTy, i32Ty});
+      readvFunc = rewriter.create<LLVM::LLVMFuncOp>(loc, "readv", readvType);
     }
 
-    // Allocate the array of iovec structs on the stack (alloca)
-    Value vectorCountI32 = rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), adaptor.getCount());
+    // 3. Prepare arguments
+    Value fdI32 = adaptor.getFd();
+    Value vectorCountI32 = rewriter.create<LLVM::TruncOp>(loc, i32Ty, adaptor.getCount());
+
+    // 4. Allocate iovec array on stack
     Value iovecArrayPtr = rewriter.create<LLVM::AllocaOp>(
         loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
-    // Extract the raw contiguous base pointers from the lowered MemRef descriptors
-    auto ptrsMemRefTy = cast<MemRefType>(op.getPtrs().getType());
-    auto sizesMemRefTy = cast<MemRefType>(op.getSizes().getType());
-    Value ptrsRaw = getStridedElementPtr(rewriter, loc, ptrsMemRefTy, adaptor.getPtrs(), {});
-    Value sizesRaw = getStridedElementPtr(rewriter, loc, sizesMemRefTy, adaptor.getSizes(), {});
-
-    // Generate an SCF loop to populate the iovec array
+    // 5. Setup loop to populate iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value countIndex = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), op.getCount());
     Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value countIndex = op.getCount(); 
 
     auto loop = rewriter.create<scf::ForOp>(loc, zero, countIndex, one);
     
@@ -227,35 +222,33 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     Value iv = loop.getInductionVar();
     Value ivI64 = rewriter.create<arith::IndexCastOp>(loc, sizeTy, iv);
 
-    // Load ptr = ptrsRaw[iv]
-    Value ptrAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, voidPtrTy, ptrsRaw, ivI64);
-    Value ptrVal = rewriter.create<LLVM::LoadOp>(loc, voidPtrTy, ptrAddr);
+    // --- Synchronized MemRef Access (Same as WriteV) ---
+    // Load the pointer address (i64) and convert to LLVM Pointer
+    Value ptrValI64 = rewriter.create<memref::LoadOp>(loc, op.getPtrs(), ValueRange{iv});
+    Value ptrVal = rewriter.create<LLVM::IntToPtrOp>(loc, voidPtrTy, ptrValI64);
+    
+    // Load the size (i64)
+    Value sizeVal = rewriter.create<memref::LoadOp>(loc, op.getSizes(), ValueRange{iv});
 
-    // Load size = sizesRaw[iv]
-    Value sizeAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, sizeTy, sizesRaw, ivI64);
-    Value sizeVal = rewriter.create<LLVM::LoadOp>(loc, sizeTy, sizeAddr);
-
-    // Get reference to iovecArray[iv]
+    // 6. Populate iovec[iv]
     Value iovAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
 
-    // Store ptr into iovecArray[iv].iov_base (Index 0)
+    // iovec[iv].iov_base
     Value iovBaseAddr = rewriter.create<LLVM::GEPOp>(
         loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
     rewriter.create<LLVM::StoreOp>(loc, ptrVal, iovBaseAddr);
 
-    // Store size into iovecArray[iv].iov_len (Index 1)
+    // iovec[iv].iov_len
     Value iovLenAddr = rewriter.create<LLVM::GEPOp>(
         loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
     rewriter.create<LLVM::StoreOp>(loc, sizeVal, iovLenAddr);
 
     rewriter.setInsertionPointAfter(loop);
 
-    // Make the optimised gather I/O system call
-    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    // 7. Make the system call
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         loc, readvFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
-    // Replace the high-level io.batch_readv with the result of the system call (bytes read)
     rewriter.replaceOp(op, llvmCall.getResult());
     
     return success();
