@@ -63,3 +63,18 @@ def IO_BatchWriteVOp : IO_Op<"batch_writev"> {
   let results = (outs I64:$bytes_written);
   let assemblyFormat = "$fd `,` $ptrs `,` $sizes `,` $count attr-dict `:` type($ptrs) `,` type($sizes)";
 }
+
+
+// ============================================================================
+// Bridge IR
+// ============================================================================
+def IOCastOp : IO_Op<"cast"> {
+  let summary = "Type bridge between ClangIR and standard MLIR dialects";
+  let description = [{
+    This operation acts as a legal bridge to carry ClangIR types (like !cir.int)
+    into standard MLIR types (like i32) without triggering verifier crashes.
+  }];
+
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$output);
+}

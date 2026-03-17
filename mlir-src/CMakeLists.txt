@@ -23,6 +23,19 @@ find_library(MLIRCIR_INTERFACES_LIB
     NO_DEFAULT_PATH
 )
 
+find_library(MLIRCIR_TRANSFORMS_LIB
+    NAMES MLIRCIRTransforms
+    PATHS ${LLVM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+)
+
+find_library(TARGET_LOWERING_LIB
+    NAMES TargetLowering
+    PATHS ${LLVM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+)
+
+
 if(NOT MLIRCIR_LIB OR NOT MLIRCIR_INTERFACES_LIB)
     message(FATAL_ERROR "Could not find ClangIR libraries in ${LLVM_LIBRARY_DIR}!")
 endif()
@@ -42,6 +55,31 @@ find_library(CLANGLEX_LIB
 find_library(CLANGBASIC_LIB 
     NAMES clangBasic 
     PATHS ${LLVM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+)
+
+
+find_library(CLANGCIRLOWERINGDIRECTTOLLVM_LIB
+    NAMES clangCIRLoweringDirectToLLVM
+    PATHS ${LLVM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+)
+
+find_library(CLANGCIRLOWERINHELPERS_LIB
+    NAMES clangCIRLoweringHelpers
+    PATHS ${LLVM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+)
+
+find_library(CLANGCIR_LIB
+    NAMES clangCIR
+    PATHS ${LLVM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+)
+
+find_library(CLANGCPP_LIB
+    NAMES clang-cpp
+    PATHS ${LLVM_LIBRARY_DIR}
     NO_DEFAULT_PATH
 )
 
@@ -89,6 +127,7 @@ target_link_libraries(MLIRIOOptimiser PRIVATE
   MLIRFuncDialect
   MLIRLLVMDialect
   MLIRLLVMCommonConversion
+  MLIRRegisterAllPasses
   ${MLIRCIR_LIB}
   ${MLIRCIR_INTERFACES_LIB}
   ${CLANGAST_LIB}
@@ -106,23 +145,85 @@ target_include_directories(MLIRIOOptimiser PUBLIC
 
 add_executable(io-opt io-opt.cpp)
 
+#target_link_libraries(io-opt PRIVATE
+#  MLIRIOOptimiser
+#  MLIROptLib
+#  MLIRIR
+#  MLIRParser
+#  MLIRPass
+#  MLIRTransforms
+#  MLIRSupport
+#  MLIRArithDialect
+#  MLIRMemRefDialect
+#  MLIRFuncDialect
+#  MLIRLLVMDialect
+#  MLIRSCFDialect
+#  MLIRRegisterAllPasses
+#  ${CLANGCIRLOWERINGDIRECTTOLLVM_LIB}
+#  ${CLANGCIRLOWERINHELPERS_LIB}
+#  ${TARGET_LOWERING_LIB}
+#  ${MLIRCIR_INTERFACES_LIB}
+#  ${CLANGCIR_LIB}
+#  ${MLIRCIR_TRANSFORMS_LIB}
+#  ${MLIRCIR_LIB}
+#  ${CLANGAST_LIB}
+#  ${CLANGLEX_LIB}
+#  ${CLANGBASIC_LIB}
+#  ${LLVM_CORE_DEPS}
+#  MLIRTargetLLVMIRExport
+#  MLIRBuiltinToLLVMIRTranslation
+#  MLIRLLVMToLLVMIRTranslation
+#  MLIROpenMPToLLVMIRTranslation
+#)
 target_link_libraries(io-opt PRIVATE
-  MLIRIOOptimiser
-  MLIROptLib
-  MLIRIR
-  MLIRParser
-  MLIRPass
-  MLIRTransforms
-  MLIRSupport
-  MLIRArithDialect
-  MLIRMemRefDialect
-  MLIRFuncDialect
-  MLIRLLVMDialect
-  MLIRSCFDialect
-  ${MLIRCIR_LIB}
-  ${MLIRCIR_INTERFACES_LIB}
-  ${CLANGAST_LIB}
-  ${CLANGLEX_LIB}
-  ${CLANGBASIC_LIB}
-  ${LLVM_CORE_DEPS}
+    # 1. Your Top-Level Logic
+    MLIRIOOptimiser
+
+    # 2. THE CONSUMERS (Start here)
+    ${CLANGCIRLOWERINGDIRECTTOLLVM_LIB}
+    ${CLANGCIRLOWERINHELPERS_LIB}
+    ${TARGET_LOWERING_LIB}
+
+    # 3. THE TRANSFORMS (The middle of the sandwich)
+    ${MLIRCIR_TRANSFORMS_LIB}
+
+    # 4. THE DIALECT & INTERFACES (The heart of the cycle)
+    # We list these here to provide symbols for the Transforms above...
+    ${MLIRCIR_LIB}
+    ${CLANGCIR_LIB}
+    ${MLIRCIR_INTERFACES_LIB}
+
+    # 5. THE TRANSFORMS (The back-reference)
+    # ...and we list these AGAIN to provide the "createPass" symbols 
+    # that the Dialect (listed just above) needs.
+    ${MLIRCIR_TRANSFORMS_LIB}
+
+    # 6. CLANG AST & BASIC (The foundation)
+    # This must follow the Dialect/Transforms because they all call into the AST.
+    ${CLANGAST_LIB}
+    ${CLANGLEX_LIB}
+    ${CLANGBASIC_LIB}
+   
+    ${CLANGCPP_LIB}
+ 
+    # 8. MLIR CORE
+    MLIROptLib
+    MLIRRegisterAllPasses
+    MLIRSCFDialect
+    MLIRLLVMDialect
+    MLIRFuncDialect
+    MLIRMemRefDialect
+    MLIRArithDialect
+    MLIRTransforms
+    MLIRPass
+    MLIRParser
+    MLIRIR
+    MLIRSupport
+
+    # 9. TRANSLATION & LLVM
+    MLIRTargetLLVMIRExport
+    MLIRBuiltinToLLVMIRTranslation
+    MLIRLLVMToLLVMIRTranslation
+    MLIROpenMPToLLVMIRTranslation
+    ${LLVM_CORE_DEPS}
 )

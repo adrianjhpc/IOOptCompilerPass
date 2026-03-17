@@ -10,10 +10,11 @@ LIB_DIR = "../build/llvm-src/"
 
 CLANG = "clang++"
 IO_OPT = os.path.join(TOOLCHAIN_DIR, "io-opt")
-MLIR_TRANSLATE = "mlir-translate"
+CIR_TRANSLATE = "cir-translate"
 OPT = "opt"
 CIR_OPT = "cir-opt"
 LLVM_LINK = "llvm-link"
+LLVM_AS = "llvm-as"
 
 LLVM_PLUGIN = os.path.join(LIB_DIR, "IOOpt.so")
 RUNTIME_LIB = "-lIORuntime"
@@ -30,60 +31,45 @@ def compile_to_bitcode(source_file, output_bc, flags):
     """Stage 1: Source -> CIR -> Std MLIR -> IO Opt -> LLVM Dialect -> LLVM IR -> LLVM Bitcode"""
     base = os.path.splitext(source_file)[0]
     cir_mlir_file = f"{base}_cir.mlir"
-    std_mlir_file = f"{base}_std.mlir"
-    opt_mlir_file = f"{base}_opt.mlir"
-    llvm_dialect_file = f"{base}_llvm.mlir"
-    llvm_dialect_dirty_file = f"{base}_llvm_dirty.mlir"
     llvm_dialect_clean_file = f"{base}_llvm_clean.mlir"
-
     ll_file = f"{base}.ll"
 
-    # Frontend: C++ to ClangIR
-    run_cmd([CLANG, "-fclangir", "-emit-mlir", source_file, "-o", cir_mlir_file, "-O3"] + flags, 
+    # 1. Frontend: C++ to ClangIR
+    run_cmd([CLANG, "-fclangir", "-emit-cir", source_file, "-o", cir_mlir_file] + flags,
             f"Frontend (Source code to CIR) for {source_file}")
 
-    # Lowering CIR to Standard MLIR
-    run_cmd([CIR_OPT, cir_mlir_file, "--cir-to-mlir", "-o", std_mlir_file], 
-            f"Lowering CIR to Standard MLIR")
+    # 2. The Mega-Pipeline: End-to-End lowering in a single binary!
+    run_cmd([IO_OPT, cir_mlir_file,
+             "--allow-unregistered-dialect",
+             "--io-loop-batching",
+             "--convert-io-to-llvm",
+             "--convert-scf-to-cf",
+             "--convert-cf-to-llvm",
+             "--convert-arith-to-llvm",
+             "--convert-index-to-llvm",
+             "--finalize-memref-to-llvm",
+             "--reconcile-unrealized-casts",
+             
+             # --- The In-Memory Bypass ---
+             "--verify-each=false",          # Turn off the global verifier
+             "--cir-to-llvm-inhouse",        # 1. Let ClangIR do its thing first
+             "--remove-io-cast",             # 2. We clean up our casts and emit ptrtoint
+             "--reconcile-unrealized-casts", # 3. Garbage collect the temporary casts
+             
+             "-o", llvm_dialect_clean_file],
+            f"End-to-End MLIR Compilation")
 
-    # Clean up
-    # mem2reg: Promotes stack memory (alloca) to SSA registers
-    # canonicalize: Folds the resulting branches into pure scf.for loops
-    run_cmd([CIR_OPT, std_mlir_file, 
-             "--pass-pipeline=builtin.module(func.func(mem2reg,canonicalize))", 
-             "-o", std_mlir_file], 
-            f"MLIR Cleanup (mem2reg & canonicalize)")
-
-    # MLIR Pass: io-opt (our custom optimisations)
-    run_cmd([IO_OPT, std_mlir_file, 
-             "--allow-unregistered-dialect", 
-             "--recognise-io", "--io-loop-batching", "--convert-io-to-llvm", 
-             "-o", opt_mlir_file], 
-            f"MLIR Optimisation (io-opt)")
-
-    # Bridge: Standard MLIR to LLVM Dialect
-    # This lowers scf, func, and memref to LLVM, and strips CIR metadata
-    run_cmd([CIR_OPT, opt_mlir_file, 
-             "--cir-mlir-to-llvm", 
-             "-o", llvm_dialect_dirty_file], 
-            f"Lowering to LLVM Dialect")
-
-    # Tidy up the CIR output
-    run_cmd([IO_OPT, llvm_dialect_dirty_file, "--strip-cir-attrs", "-o", llvm_dialect_clean_file], 
-            f"Stripping ClangIR Attributes")
-
-    # Translate: Pure LLVM Dialect to LLVM IR
-    run_cmd([MLIR_TRANSLATE, llvm_dialect_clean_file, "--mlir-to-llvmir", "-o", ll_file], 
+    # 3. Translate: Pure LLVM Dialect to LLVM IR Text
+    run_cmd([CIR_TRANSLATE, llvm_dialect_clean_file, "--cir-to-llvmir", "-o", ll_file],
             f"Translation to LLVM IR")
-
-    # LLVM Pass (Compile-Time) & Emit Bitcode
-    run_cmd([OPT, "-load-pass-plugin", LLVM_PLUGIN, "-passes=function(io-opt),default<O1>", 
-             ll_file, "-o", output_bc], 
-            f"LLVM Compile-Time Optimisation")
+            
+    # 4. Assemble: LLVM IR Text to LLVM Bitcode (This creates the actual .bc file!)
+    run_cmd([LLVM_AS, ll_file, "-o", output_bc],
+            f"Assembling to Bitcode ({output_bc})")
 
     # Cleanup intermediate files
-#    for f in [cir_mlir_file, std_mlir_file, opt_mlir_file, llvm_dialect_file, llvm_dialect_dirty_file, llvm_dialect_clean_file, ll_file]:
-#        if os.path.exists(f): os.remove(f)
+    for f in [cir_mlir_file, llvm_dialect_clean_file, ll_file, ]:
+        if os.path.exists(f): os.remove(f)
 
 def link_with_lto(input_bcs, output_bin, flags):
     """Stage 2: Link Bitcode -> LTO LLVM Pass -> Executable"""
