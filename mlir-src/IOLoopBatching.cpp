@@ -8,11 +8,15 @@
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "clang/CIR/Dialect/IR/CIRDialect.h"
-#include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "clang/CIR/Dialect/IR/CIRAttrs.h"
+
+#include "llvm/Support/CommandLine.h"
+
 #include "IODialect.h"
+#include "TargetUtils.h"
 
 using namespace mlir;
 
@@ -520,7 +524,9 @@ struct StripCIRAttrsPass : public PassWrapper<StripCIRAttrsPass, OperationPass<M
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    
+   
+    mlir::io::bootstrapTargetInfo(module);
+ 
     // Walk every single operation in the entire file (Functions, Globals, Blocks)
     module.walk([&](Operation *op) {
       SmallVector<StringAttr, 4> attrsToRemove;
@@ -565,6 +571,9 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
     // Because the class inherits from OperationPass<ModuleOp>, 
     // getOperation() will now legally return a ModuleOp!
     ModuleOp module = getOperation();
+
+    mlir::io::bootstrapTargetInfo(module);
+
     MLIRContext *context = &getContext();
 
     AliasAnalysis &aliasAnalysis = getAnalysis<AliasAnalysis>();

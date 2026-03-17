@@ -7,6 +7,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include "IODialect.h"
+#include "TargetUtils.h"
 
 using namespace mlir;
 
@@ -265,12 +266,15 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
     registry.insert<LLVM::LLVMDialect>();
     registry.insert<scf::SCFDialect>();
     registry.insert<memref::MemRefDialect>();
-    // FIX 1: Tell MLIR to load the Arith dialect
     registry.insert<arith::ArithDialect>(); 
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+
+    mlir::io::bootstrapTargetInfo(module);
+
+
     MLIRContext *context = &getContext();
 
     LLVMTypeConverter typeConverter(context);

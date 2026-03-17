@@ -2,7 +2,9 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Pass/Pass.h"
+
 #include "IODialect.h"
+#include "TargetUtils.h"
 
 using namespace mlir;
 
@@ -73,8 +75,8 @@ struct LiftReadPattern : public OpRewritePattern<func::CallOp> {
   }
 };
 
-struct RecognizeIOPass : public PassWrapper<RecognizeIOPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RecognizeIOPass)
+struct RecogniseIOPass : public PassWrapper<RecogniseIOPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RecogniseIOPass)
 
   llvm::StringRef getArgument() const final { return "recognise-io"; }
   llvm::StringRef getDescription() const final { return "Lifts standard C library I/O calls into the custom IO dialect."; }
@@ -86,6 +88,8 @@ struct RecognizeIOPass : public PassWrapper<RecognizeIOPass, OperationPass<Modul
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MLIRContext *context = &getContext();
+
+    mlir::io::bootstrapTargetInfo(module);
 
     RewritePatternSet patterns(context);
     patterns.add<LiftWritePattern>(context);
@@ -103,12 +107,12 @@ struct RecognizeIOPass : public PassWrapper<RecognizeIOPass, OperationPass<Modul
 // Expose it to the pass manager
 namespace mlir {
 namespace io {
-  std::unique_ptr<mlir::Pass> createRecognizeIOPass() {
-    return std::make_unique<RecognizeIOPass>();
+  std::unique_ptr<mlir::Pass> createRecogniseIOPass() {
+    return std::make_unique<RecogniseIOPass>();
   }
   
-  void registerRecognizeIOPass() {
-    PassRegistration<RecognizeIOPass>();
+  void registerRecogniseIOPass() {
+    PassRegistration<RecogniseIOPass>();
   }
 } // namespace io
 } // namespace mlir

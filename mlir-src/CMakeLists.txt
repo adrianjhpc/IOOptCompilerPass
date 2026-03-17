@@ -109,7 +109,8 @@ add_library(MLIRIOOptimiser
   IODialect.cpp 
   IOLoopBatching.cpp
   IOLoweringToLLVM.cpp
-  IORecognition.cpp)
+  IORecognition.cpp
+  TargetUtils.cpp)
 
 # Ensure TableGen runs BEFORE trying to compile the C++ files
 add_dependencies(MLIRIOOptimiser IODialectIncGen)
@@ -145,68 +146,20 @@ target_include_directories(MLIRIOOptimiser PUBLIC
 
 add_executable(io-opt io-opt.cpp)
 
-#target_link_libraries(io-opt PRIVATE
-#  MLIRIOOptimiser
-#  MLIROptLib
-#  MLIRIR
-#  MLIRParser
-#  MLIRPass
-#  MLIRTransforms
-#  MLIRSupport
-#  MLIRArithDialect
-#  MLIRMemRefDialect
-#  MLIRFuncDialect
-#  MLIRLLVMDialect
-#  MLIRSCFDialect
-#  MLIRRegisterAllPasses
-#  ${CLANGCIRLOWERINGDIRECTTOLLVM_LIB}
-#  ${CLANGCIRLOWERINHELPERS_LIB}
-#  ${TARGET_LOWERING_LIB}
-#  ${MLIRCIR_INTERFACES_LIB}
-#  ${CLANGCIR_LIB}
-#  ${MLIRCIR_TRANSFORMS_LIB}
-#  ${MLIRCIR_LIB}
-#  ${CLANGAST_LIB}
-#  ${CLANGLEX_LIB}
-#  ${CLANGBASIC_LIB}
-#  ${LLVM_CORE_DEPS}
-#  MLIRTargetLLVMIRExport
-#  MLIRBuiltinToLLVMIRTranslation
-#  MLIRLLVMToLLVMIRTranslation
-#  MLIROpenMPToLLVMIRTranslation
-#)
 target_link_libraries(io-opt PRIVATE
-    # 1. Your Top-Level Logic
     MLIRIOOptimiser
-
-    # 2. THE CONSUMERS (Start here)
     ${CLANGCIRLOWERINGDIRECTTOLLVM_LIB}
     ${CLANGCIRLOWERINHELPERS_LIB}
     ${TARGET_LOWERING_LIB}
-
-    # 3. THE TRANSFORMS (The middle of the sandwich)
     ${MLIRCIR_TRANSFORMS_LIB}
-
-    # 4. THE DIALECT & INTERFACES (The heart of the cycle)
-    # We list these here to provide symbols for the Transforms above...
     ${MLIRCIR_LIB}
     ${CLANGCIR_LIB}
     ${MLIRCIR_INTERFACES_LIB}
-
-    # 5. THE TRANSFORMS (The back-reference)
-    # ...and we list these AGAIN to provide the "createPass" symbols 
-    # that the Dialect (listed just above) needs.
     ${MLIRCIR_TRANSFORMS_LIB}
-
-    # 6. CLANG AST & BASIC (The foundation)
-    # This must follow the Dialect/Transforms because they all call into the AST.
     ${CLANGAST_LIB}
     ${CLANGLEX_LIB}
     ${CLANGBASIC_LIB}
-   
     ${CLANGCPP_LIB}
- 
-    # 8. MLIR CORE
     MLIROptLib
     MLIRRegisterAllPasses
     MLIRSCFDialect
@@ -219,8 +172,6 @@ target_link_libraries(io-opt PRIVATE
     MLIRParser
     MLIRIR
     MLIRSupport
-
-    # 9. TRANSLATION & LLVM
     MLIRTargetLLVMIRExport
     MLIRBuiltinToLLVMIRTranslation
     MLIRLLVMToLLVMIRTranslation

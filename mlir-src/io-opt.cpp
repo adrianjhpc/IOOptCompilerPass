@@ -9,6 +9,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassManager.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Host.h"
 
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Passes.h"
@@ -18,7 +22,7 @@
 // Forward declare our custom pass registration functions
 namespace mlir {
 namespace io {
-  void registerRecognizeIOPass();
+  void registerRecogniseIOPass();
   void registerIOPasses();
   void registerConvertIOToLLVMPass();
 }
@@ -40,14 +44,14 @@ struct RemoveIOCastPass : public mlir::PassWrapper<RemoveIOCastPass, mlir::Opera
     std::vector<mlir::Operation*> opsToErase;
 
     getOperation()->walk([&](mlir::Operation *op) {
-      // 1. Fix ClangIR's Opaque Pointer Bug (Delete redundant bitcasts)
+      //Fix ClangIR's Opaque Pointer Bug (Delete redundant bitcasts)
       if (op->getName().getStringRef() == "llvm.bitcast") {
         if (op->getOperand(0).getType() == op->getResult(0).getType()) {
           op->getResult(0).replaceAllUsesWith(op->getOperand(0));
           opsToErase.push_back(op);
         }
       } 
-      // 2. Clean up our custom IO bridges
+      // Clean up our custom IO bridges
       else if (op->getName().getStringRef() == "io.cast") {
         mlir::Value operand = op->getOperand(0);
         mlir::Value result = op->getResult(0);
@@ -114,7 +118,7 @@ int main(int argc, char **argv) {
                   cir::CIRDialect>();
 
   // Register our custom passes
-  mlir::io::registerRecognizeIOPass();
+  mlir::io::registerRecogniseIOPass();
   mlir::io::registerIOPasses();
   mlir::io::registerConvertIOToLLVMPass();
   mlir::PassRegistration<RemoveIOCastPass>();
