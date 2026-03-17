@@ -24,4 +24,5 @@ testing/postgres_optimised
 testing/postgres_lto_optimised
 testing/postgresql-*
 testing/redis-*
+testing/rocksdb
 *~
