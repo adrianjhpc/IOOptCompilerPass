@@ -25,6 +25,7 @@ namespace io {
   void registerRecogniseIOPass();
   void registerIOPasses();
   void registerConvertIOToLLVMPass();
+  void registerAdvancedIOPasses();
 }
 }
 
@@ -121,9 +122,9 @@ int main(int argc, char **argv) {
   mlir::io::registerRecogniseIOPass();
   mlir::io::registerIOPasses();
   mlir::io::registerConvertIOToLLVMPass();
+  mlir::io::registerAdvancedIOPasses(); 
   mlir::PassRegistration<RemoveIOCastPass>();
   mlir::PassRegistration<CIRToLLVMInHousePass>();
-
   // Start the MLIR command-line tool
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "IO Optimiser tool\n", registry));

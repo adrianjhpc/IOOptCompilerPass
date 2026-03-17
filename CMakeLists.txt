@@ -122,6 +122,9 @@ endif()
 
 find_package(MPI)
 
+enable_testing()
+
 add_subdirectory(llvm-src)
 add_subdirectory(benchmarks)
 add_subdirectory(mlir-src)
+add_subdirectory(mlir-tests)

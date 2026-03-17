@@ -110,6 +110,7 @@ add_library(MLIRIOOptimiser
   IOLoopBatching.cpp
   IOLoweringToLLVM.cpp
   IORecognition.cpp
+  IOAdvancedOptimisations.cpp
   TargetUtils.cpp)
 
 # Ensure TableGen runs BEFORE trying to compile the C++ files
