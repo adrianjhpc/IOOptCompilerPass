@@ -7,9 +7,10 @@ import argparse
 TOOLCHAIN_DIR = "../build/mlir-src/"
 LIB_DIR = "../build/llvm-src/"
 
-# Define both compilers
+# Define standard toolchain
 CLANG_C = "clang"
 CLANG_CXX = "clang++"
+LLVM_AR = "llvm-ar" # <-- Added for static libraries
 
 IO_OPT = os.path.join(TOOLCHAIN_DIR, "io-opt")
 CIR_TRANSLATE = "cir-translate"
@@ -91,14 +92,32 @@ def compile_to_bitcode(source_file, output_bc, target_triple, flags, disable_mli
         if os.path.exists(f): os.remove(f)
 
 def link_with_lto(input_bcs, output_bin, target_triple, flags, disable_llvm, requires_cxx_linker):
-    """Stage 2: Link Bitcode -> LTO LLVM Pass -> Executable"""
-    merged_bc = "merged.bc"
-    lto_opt_bc = "merged_opt.bc"
+    """Stage 2: Link Bitcode -> LTO LLVM Pass -> Executable/Library"""
+    
+    # --- 1. Static Library (.a) Fast Path ---
+    if output_bin.endswith('.a'):
+        # For static libraries, we just archive the bitcode files. 
+        # The LTO pass will run when the executable eventually links this archive.
+        run_cmd([LLVM_AR, "rcs", output_bin] + input_bcs,
+                f"Archiving Static Library ({output_bin})")
+        return
+
+    # --- 2. Multiple Binaries (Concurrency Fix) ---
+    # Use the target binary name to create unique intermediate files. 
+    # This prevents parallel 'make -j' processes from overwriting each other's bitcode!
+    base_name = os.path.splitext(output_bin)[0]
+    merged_bc = f"{base_name}_merged.bc"
+    lto_opt_bc = f"{base_name}_merged_opt.bc"
 
     clang_target_flag = [f"--target={target_triple}"] if target_triple else []
+    
+    # --- 3. Shared Objects (.so) Fix ---
+    # Ensure -shared is passed down if requested by the build system
+    is_shared = "-shared" in flags or output_bin.endswith('.so')
+    shared_flag = ["-shared"] if is_shared and "-shared" not in flags else []
 
     run_cmd([LLVM_LINK] + input_bcs + ["-o", merged_bc],
-            "Merging Bitcode (llvm-link)")
+            f"Merging Bitcode (llvm-link) for {output_bin}")
 
     if disable_llvm:
         opt_cmd = [OPT, "-passes=default<O1>", merged_bc, "-o", lto_opt_bc]
@@ -107,14 +126,15 @@ def link_with_lto(input_bcs, output_bin, target_triple, flags, disable_llvm, req
                  "-passes=io-lto-merge,default<O1>",
                  merged_bc, "-o", lto_opt_bc]
 
-    run_cmd(opt_cmd, f"LLVM Link-Time Optimisation (LLVM Opt: {'OFF' if disable_llvm else 'ON'})")
+    run_cmd(opt_cmd, f"LLVM Link-Time Optimisation for {output_bin} (LLVM Opt: {'OFF' if disable_llvm else 'ON'})")
 
     # Final Code Generation & Linking
-    # Use clang++ if any C++ files were in the project, otherwise use clang
     linker = CLANG_CXX if requires_cxx_linker else CLANG_C
-    run_cmd([linker, lto_opt_bc, "-o", output_bin] + clang_target_flag + flags,
-            f"Final Code Generation & Linking (using {linker})")
+    final_cmd = [linker, lto_opt_bc, "-o", output_bin] + clang_target_flag + shared_flag + flags
+    
+    run_cmd(final_cmd, f"Final Code Generation & Linking ({output_bin} using {linker})")
 
+    # Cleanup
     for f in [merged_bc, lto_opt_bc]:
         if os.path.exists(f): os.remove(f)
 
@@ -142,22 +162,22 @@ def main():
             target_triple = "x86_64-unknown-linux-gnu"
     # ------------------------------------
 
+    # Treat object files (.o) in the input as bitcode files (.bc) since our Phase 1 outputs bitcode
     sources = [f for f in args.inputs if f.endswith(('.c', '.cpp', '.cxx', '.cc'))]
-    objects = [f for f in args.inputs if f.endswith(('.o', '.bc'))]
+    objects = [f for f in args.inputs if f.endswith(('.o', '.bc', '.a'))]
 
-    # Check if we need the C++ linker (if any source is a C++ file)
     requires_cxx_linker = any(src.endswith(('.cpp', '.cxx', '.cc')) for src in sources)
 
     if args.c:
         # Compile only mode
         for src in sources:
-            out_file = args.output if args.output else f"{os.path.splitext(src)[0]}.bc"
+            out_file = args.output if args.output else f"{os.path.splitext(src)[0]}.o"
             compile_to_bitcode(src, out_file, target_triple, unknown_flags, args.disable_mlir)
     else:
         # Compile and link mode
         bcs_to_link = objects.copy()
         for src in sources:
-            bc_file = f"{os.path.splitext(src)[0]}.bc"
+            bc_file = f"{os.path.splitext(src)[0]}.o"
             compile_to_bitcode(src, bc_file, target_triple, unknown_flags, args.disable_mlir)
             bcs_to_link.append(bc_file)
 
