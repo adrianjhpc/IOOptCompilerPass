@@ -124,6 +124,7 @@ find_package(MPI)
 
 enable_testing()
 
+add_subdirectory(runtime_src)
 add_subdirectory(llvm-src)
 add_subdirectory(benchmarks)
 add_subdirectory(mlir-src)
