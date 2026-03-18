@@ -3,6 +3,7 @@ import sys
 import os
 import subprocess
 import argparse
+import re
 
 TOOLCHAIN_DIR = "/home/adrianj/IOOptCompilerPass/build/mlir-src/"
 LIB_DIR = "/home/adrianj/IOOptCompilerPass/build/llvm-src/"
@@ -79,6 +80,27 @@ def compile_to_bitcode(source_file, output_bc, target_triple, flags, disable_mli
         cleanup_intermediates()
         return
 
+    # =========================================================================
+    # The ClangIR Padding Bug Sanitizer
+    # =========================================================================
+    # Fixing upstream ClangIR array padding bugs before the MLIR verifier chokes on them.
+    try:
+        with open(cir_mlir_file, 'r') as f:
+            mlir_code = f.read()
+
+        # Find: #cir.const_array<"string" : !cir.array<!s8i x 4>, trailing_zeros> : !cir.array<!s8i x 64>
+        # Replace: #cir.const_array<"string" : !cir.array<!s8i x 64>, trailing_zeros> : !cir.array<!s8i x 64>
+        padding_bug_pattern = re.compile(
+            r'#cir\.const_array<(".*?")\s*:\s*!cir\.array<!s8i x [1-9][0-9]*>,\s*trailing_zeros>\s*:\s*(!cir\.array<!s8i x 64>)'
+        )
+        sanitized_code = padding_bug_pattern.sub(r'#cir.const_array<\1 : \2, trailing_zeros> : \2', mlir_code)
+
+        with open(cir_mlir_file, 'w') as f:
+            f.write(sanitized_code)
+            
+    except Exception as e:
+        print(f"[Warning] Failed to run MLIR Sanitizer on {cir_mlir_file}: {e}")  
+  
     # 2. Build the End-to-End MLIR pipeline
     io_opt_cmd = [
         IO_OPT, cir_mlir_file,
@@ -159,16 +181,19 @@ def link_with_lto(input_bcs, output_bin, target_triple, flags, disable_llvm, req
 
     # Final Code Generation & Linking
     linker = CLANG_CXX if requires_cxx_linker else CLANG_C
-    
-    # Force LLD and LTO so the linker can read bitcode archives (.a) 
-    lto_flags = ["-fuse-ld=lld", "-flto"] 
-    
+
+    # Force LLD and LTO so the linker can read bitcode archives (.a)
+    lto_flags = ["-fuse-ld=lld", "-flto"]
+
     final_cmd = [linker, lto_opt_bc, "-o", output_bin] + clang_target_flag + shared_flag + lto_flags + flags
-   
-    # If it's linking, inject our runtime library
-    if is_linking and os.path.exists(RUNTIME_LIB):
-        final_clang_cmd.append(RUNTIME_LIB)
- 
+
+    # --- UPDATED INJECTION LOGIC ---
+    # We are generating a final binary or shared object, so inject the runtime library!
+    if os.path.exists(RUNTIME_LIB):
+        final_cmd.append(RUNTIME_LIB)
+    else:
+        print(f"[Warning] ioopt_runtime.a not found at {RUNTIME_LIB}. IO optimizations may fail to link!")
+
     run_cmd(final_cmd, f"Final Code Generation & Linking ({output_bin} using {linker})")
 
     # Cleanup
@@ -236,17 +261,41 @@ def main():
     # --- 3. Route to the correct pipeline ---
     requires_cxx_linker = any(src.endswith(('.cpp', '.cxx', '.cc')) for src in sources)
 
+    # TEMPORARY HACK
+    # Create blacklist of files known to break with the ClangCI cir tool
+    # At the moment it is a very blunt tool
+    cir_blacklist = [
+        "crc32",     # Fails on SSE4.2 hardware intrinsics
+        "analyze.c", 
+        "copyfrom.c",
+        "explain.c",
+        "foreigncmds.c",
+        "tablecmds.c",
+        "execMain.c",
+        "execPartition.c",
+        "nodeForeignscan.c",
+        "nodeLockRows.c",
+        "nodeModifyTable.c"     
+    ]
+
     if args_c:
         # Compile only mode
         for src in sources:
+            # Check if the current source file is in our blacklist
+            safe_disable_mlir = disable_mlir or any(bad_file in src for bad_file in cir_blacklist)
+            
             out_file = args_output if args_output else f"{os.path.splitext(src)[0]}.o"
-            compile_to_bitcode(src, out_file, target_triple, unknown_flags, disable_mlir)
+            compile_to_bitcode(src, out_file, target_triple, unknown_flags, safe_disable_mlir)
+            
     else:
         # Compile and link mode
         bcs_to_link = objects.copy()
         for src in sources:
+            # Check if the current source file is in our blacklist
+            safe_disable_mlir = disable_mlir or any(bad_file in src for bad_file in cir_blacklist)
+            
             bc_file = f"{os.path.splitext(src)[0]}.o"
-            compile_to_bitcode(src, bc_file, target_triple, unknown_flags, disable_mlir)
+            compile_to_bitcode(src, bc_file, target_triple, unknown_flags, safe_disable_mlir)
             bcs_to_link.append(bc_file)
 
         out_bin = args_output if args_output else "a.out"
