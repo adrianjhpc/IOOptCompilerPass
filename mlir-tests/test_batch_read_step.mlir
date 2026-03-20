@@ -1,4 +1,4 @@
-// RUN: io-opt %s --io-loop-batching | FileCheck %s
+// RUN: io-opt %s --io-loop-batching | %FileCheck %s
 
 !s32i = !cir.int<s, 32>
 !s8i = !cir.int<s, 8>

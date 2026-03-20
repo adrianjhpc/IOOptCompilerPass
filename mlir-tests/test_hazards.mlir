@@ -1,4 +1,4 @@
-// RUN: io-opt %s --io-loop-batching | FileCheck %s
+// RUN: io-opt %s --io-loop-batching | %FileCheck %s
 
 // An unknown external function that could do anything
 func.func private @opaque_side_effect_function()

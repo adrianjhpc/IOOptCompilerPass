@@ -1,4 +1,4 @@
-// RUN: io-opt %s --io-loop-batching | FileCheck %s
+// RUN: io-opt %s --io-loop-batching | %FileCheck %s
 
 // ============================================================================
 // TEST 1: The Contiguous Read Fast-Path

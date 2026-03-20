@@ -1,4 +1,4 @@
-// RUN: io-opt -io-async-promotion %s | FileCheck %s
+// RUN: io-opt -io-async-promotion %s | %FileCheck %s
 
 func.func private @read(i32, !llvm.ptr, i64) -> i64
 func.func private @opaque_side_effect() -> ()

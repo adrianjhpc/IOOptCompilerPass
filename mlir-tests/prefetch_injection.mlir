@@ -1,4 +1,4 @@
-// RUN: io-opt -io-prefetch-injection %s | FileCheck %s
+// RUN: io-opt -io-prefetch-injection %s | %FileCheck %s
 
 // Declare the mock read functions
 func.func private @read(i32, !llvm.ptr, i32) -> i64
