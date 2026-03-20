@@ -6,6 +6,7 @@
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 
@@ -197,7 +198,7 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
                     argTypes.push_back(sizeType);
                 }
                 auto funcType = builder.getFunctionType(argTypes, {retType});
-                builder.create<func::FuncOp>(module.getLoc(), funcName, funcType).setPrivate();
+                func::FuncOp::create(builder, module.getLoc(), funcName, funcType).setPrivate();
             }
         }
 
@@ -294,7 +295,8 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
                 newArgs.push_back(wCall.getArgOperands()[2]); // Size
             }
 
-            auto writevCall = replaceBuilder.create<func::CallOp>(
+            auto writevCall = func::CallOp::create(
+                replaceBuilder,
                 batch.back()->getLoc(),
                 funcName,
                 firstWriteInBatch->getResultTypes(),
@@ -477,20 +479,77 @@ struct MmapPromotionPass : public PassWrapper<MmapPromotionPass, OperationPass<f
     }
 };
 
-// ============================================================================
-// 5. Predictable Scan -> Automated Prefetch Injection
-// ============================================================================
 struct InjectPrefetchPattern : public OpRewritePattern<scf::ForOp> {
     InjectPrefetchPattern(MLIRContext *context)
         : OpRewritePattern<scf::ForOp>(context, /*benefit=*/1) {}
 
     LogicalResult matchAndRewrite(scf::ForOp forOp, PatternRewriter &rewriter) const override {
-        // TODO:
-        // 1. Check if the loop contains a sequential 'read' pattern (pointer advances by fixed size).
-        // 2. Check if the loop also contains heavy compute (high instruction count).
-        // 3. Calculate a safe lookahead distance.
-        // 4. Inject 'posix_fadvise' (or a custom io.prefetch op) into the loop to trigger kernel read-ahead.
-        return failure();
+        Value fdToPrefetch;
+        Value sizeToPrefetch;
+        Operation *readInsertionPoint = nullptr;
+        
+        bool alreadyPrefetched = false;
+        int computeInstructionCount = 0;
+
+        // 1. Scan the inside of the loop
+        forOp.walk([&](Operation *op) {
+            // Guard against infinite loops
+            if (isa<mlir::io::PrefetchOp>(op)) {
+                alreadyPrefetched = true;
+            } 
+            else if (auto readOp = dyn_cast<mlir::io::ReadOp>(op)) {
+                if (!readInsertionPoint) {
+                    fdToPrefetch = readOp.getFd();
+                    sizeToPrefetch = readOp.getSize();
+                    readInsertionPoint = op;
+                }
+            } 
+            else if (auto callOp = dyn_cast<func::CallOp>(op)) {
+                StringRef callee = callOp.getCallee(); 
+                // Fix: StringRef is an object, not a pointer. Use the == operator!
+                if (callee == "read" || callee == "read64") {
+                    if (!readInsertionPoint && callOp.getNumOperands() == 3) {
+                        fdToPrefetch = callOp.getOperand(0);
+                        sizeToPrefetch = callOp.getOperand(2);
+                        readInsertionPoint = op;
+                    }
+                }
+            } 
+            else if (!isa<scf::YieldOp>(op) && !isa<scf::ForOp>(op)) {
+                computeInstructionCount++;
+            }
+        });
+
+        if (!readInsertionPoint) return failure(); 
+        if (alreadyPrefetched) return failure();   
+        if (computeInstructionCount < 10) return failure(); 
+
+        // 2. Mutate the loop safely using the new MLIR 22 API
+        rewriter.modifyOpInPlace(forOp, [&]() {
+            rewriter.setInsertionPoint(readInsertionPoint);
+            Location loc = readInsertionPoint->getLoc();
+
+            // Mathematically Safe Type Alignment for the math operations
+            Value sizeI64 = sizeToPrefetch;
+            if (!sizeI64.getType().isInteger(64)) {
+                sizeI64 = arith::ExtUIOp::create(rewriter, loc, rewriter.getI64Type(), sizeToPrefetch);
+            }
+
+            // Calculate Lookahead (size * 4) using the modern static create methods
+            Value four = arith::ConstantOp::create(rewriter, loc, rewriter.getI64IntegerAttr(4));
+            Value lookaheadSize = arith::MulIOp::create(rewriter, loc, sizeI64, four);
+
+            mlir::io::PrefetchOp::create(
+                rewriter,
+                loc,
+                fdToPrefetch,
+                lookaheadSize
+            );
+            
+            llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Injected io.prefetch ahead of loop read!\n";
+        });
+
+        return success();
     }
 };
 
@@ -499,9 +558,17 @@ struct PrefetchInjectionPass : public PassWrapper<PrefetchInjectionPass, Operati
     StringRef getArgument() const final { return "io-prefetch-injection"; }
     StringRef getDescription() const final { return "Injects kernel read-ahead hints into compute-heavy sequential I/O loops"; }
 
+    // CRITICAL: We are generating new operations from the 'io' and 'arith' dialects.
+    // We must declare them here so MLIR loads them into the context!
+    void getDependentDialects(DialectRegistry &registry) const override {
+        registry.insert<mlir::io::IODialect, mlir::arith::ArithDialect>();
+    }
+
     void runOnOperation() override {
         RewritePatternSet patterns(&getContext());
         patterns.add<InjectPrefetchPattern>(&getContext());
+        
+        // Using the modern applyPatternsGreedily!
         if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
             signalPassFailure();
     }

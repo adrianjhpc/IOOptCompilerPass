@@ -124,3 +124,20 @@ def IO_WaitOp : IO_Op<"wait", [MemoryEffects<[MemWrite]>]> {
   let results = (outs I64:$bytes_read);
   let assemblyFormat = "$ticket attr-dict";
 }
+
+// ============================================================================
+// Prefetch / Read-Ahead Operations
+// ============================================================================
+def IO_PrefetchOp : IO_Op<"prefetch"> {
+  let summary = "Asynchronous kernel read-ahead hint";
+  let description = [{
+    Advises the kernel to aggressively prefetch data for the given file
+    descriptor. Maps down to posix_fadvise(POSIX_FADV_WILLNEED).
+  }];
+
+  // We only need the file descriptor and the lookahead size.
+  let arguments = (ins I32:$fd, I64:$lookahead_size);
+  
+  // No results, because it's purely a background performance hint.
+  let assemblyFormat = "$fd `,` $lookahead_size attr-dict";
+}
