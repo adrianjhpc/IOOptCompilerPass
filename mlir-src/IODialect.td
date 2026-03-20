@@ -141,3 +141,23 @@ def IO_PrefetchOp : IO_Op<"prefetch"> {
   // No results, because it's purely a background performance hint.
   let assemblyFormat = "$fd `,` $lookahead_size attr-dict";
 }
+
+// ============================================================================
+// Memory Mapping Operations
+// ============================================================================
+def IO_MmapOp : IO_Op<"mmap"> {
+  let summary = "Memory maps a file directly into user space";
+  let description = [{
+    Maps a file directly into the application's virtual address space. 
+    This entirely bypasses user-space buffer allocation and kernel-to-user 
+    data copying, providing zero-copy random access to file contents.
+  }];
+
+  // Arguments: file descriptor, length/size, and file offset
+  let arguments = (ins I32:$fd, I64:$size, I64:$offset);
+  
+  // Returns the pointer to the newly mapped memory block
+  let results = (outs AnyType:$buffer);
+  
+  let assemblyFormat = "$fd `,` $size `,` $offset attr-dict `:` type($buffer)";
+}

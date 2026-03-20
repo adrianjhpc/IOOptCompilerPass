@@ -341,7 +341,7 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
         // alk the function to find synchronous 'read' calls
         func.walk([&](func::CallOp callOp) {
             StringRef callee = callOp.getCallee();
-            if (callee == "read" || callee == "read64") {
+            if (callee == "read" || callee == "read64" || callee == "read32") {
                 readCandidates.push_back(callOp);
             }
         });
@@ -455,14 +455,92 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
 // ============================================================================
 struct PromoteToMmapPattern : public RewritePattern {
     PromoteToMmapPattern(MLIRContext *context)
-        : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/2, context) {}
+        : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/10, context) {}
 
     LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-        // TODO:
-        // 1. Match an allocation (malloc/alloca) whose size exactly matches a file's size (fstat).
-        // 2. Match a single massive 'read' that fills this buffer.
-        // 3. Replace the allocation and read with an 'io.mmap' operation.
-        return failure();
+        Value fd, buffer, size;
+        
+        // 1. Find a read operation
+        if (auto readOp = dyn_cast<mlir::io::ReadOp>(op)) {
+            fd = readOp.getFd();
+            buffer = readOp.getOperand(1);
+            size = readOp.getSize();
+        }
+
+        else if (auto callOp = dyn_cast<func::CallOp>(op)) {
+            StringRef callee = callOp.getCallee(); 
+            if (callee == "read" || callee == "read64" || callee == "read32") {
+                if (callOp.getNumOperands() != 3) return failure();
+                fd = callOp.getOperand(0);
+                buffer = callOp.getOperand(1);
+                size = callOp.getOperand(2);
+            } else {
+                return failure();
+            }
+        }
+        else {
+            return failure();
+        }
+
+        // 2. Trace the buffer pointer back to its allocation source
+        Operation *allocOp = buffer.getDefiningOp();
+        if (!allocOp) return failure();
+
+        Value allocSize;
+        if (auto callAlloc = dyn_cast<func::CallOp>(allocOp)) {
+            StringRef callee = callAlloc.getCallee();
+            if ((callee == "malloc" || callee == "malloc32") && callAlloc.getNumOperands() == 1) {
+                allocSize = callAlloc.getOperand(0);
+            } else {
+                return failure();
+            }
+        }
+
+        // 3. Profitability & Safety Check
+        // allocSize and size are SSA Values. This strictly ensures the program 
+        // used the exact same dynamic variable for both the malloc and the read.
+        if (allocSize != size) {
+            return failure(); 
+        }
+
+        // 4. The Rewrite
+        rewriter.setInsertionPoint(allocOp);
+        Location loc = allocOp->getLoc();
+
+        Value zeroOffset = arith::ConstantOp::create(rewriter, loc, rewriter.getI64IntegerAttr(0));
+
+        Value sizeI64 = size;
+        if (!sizeI64.getType().isInteger(64)) {
+            sizeI64 = arith::ExtUIOp::create(rewriter, loc, rewriter.getI64Type(), size);
+        }
+
+        auto mmapOp = mlir::io::MmapOp::create(
+            rewriter,
+            loc,
+            buffer.getType(), 
+            fd,
+            sizeI64, 
+            zeroOffset
+        );
+
+        // Replace all downstream uses of the malloc'd buffer with the mmap'd buffer
+        rewriter.replaceOp(allocOp, mmapOp.getBuffer());
+        
+        Value replacementResult = size;
+        Type expectedReturnType = op->getResult(0).getType();
+        
+        if (replacementResult.getType() != expectedReturnType) {
+            if (replacementResult.getType().getIntOrFloatBitWidth() < expectedReturnType.getIntOrFloatBitWidth()) {
+                replacementResult = arith::ExtUIOp::create(rewriter, loc, expectedReturnType, replacementResult);
+            } else {
+                replacementResult = arith::TruncIOp::create(rewriter, loc, expectedReturnType, replacementResult);
+            }
+        }
+
+        rewriter.replaceOp(op, replacementResult); 
+
+        llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Promoted malloc+read to io.mmap!\n";
+        return success();
     }
 };
 
@@ -470,6 +548,11 @@ struct MmapPromotionPass : public PassWrapper<MmapPromotionPass, OperationPass<f
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MmapPromotionPass)
     StringRef getArgument() const final { return "io-mmap-promotion"; }
     StringRef getDescription() const final { return "Promotes bulk file reads into memory mapped (mmap) buffers"; }
+
+    // CRITICAL: Declare dependencies on io and arith dialects!
+    void getDependentDialects(DialectRegistry &registry) const override {
+        registry.insert<mlir::io::IODialect, mlir::arith::ArithDialect>();
+    }
 
     void runOnOperation() override {
         RewritePatternSet patterns(&getContext());
@@ -507,7 +590,7 @@ struct InjectPrefetchPattern : public OpRewritePattern<scf::ForOp> {
             else if (auto callOp = dyn_cast<func::CallOp>(op)) {
                 StringRef callee = callOp.getCallee(); 
                 // Fix: StringRef is an object, not a pointer. Use the == operator!
-                if (callee == "read" || callee == "read64") {
+                if (callee == "read" || callee == "read64" || callee == "read32") {
                     if (!readInsertionPoint && callOp.getNumOperands() == 3) {
                         fdToPrefetch = callOp.getOperand(0);
                         sizeToPrefetch = callOp.getOperand(2);
