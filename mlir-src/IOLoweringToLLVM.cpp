@@ -4,6 +4,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Pass/Pass.h"
 
 #include "IODialect.h"
@@ -13,6 +14,25 @@ using namespace mlir;
 
 namespace {
 
+// ============================================================================
+// Helper: Get or Insert C-Library Function Declarations
+// ============================================================================
+static LLVM::LLVMFuncOp getOrInsertFunc(ConversionPatternRewriter &rewriter,
+                                        ModuleOp module, StringRef name,
+                                        LLVM::LLVMFunctionType type) {
+    if (auto func = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+        return func;
+
+    // If it doesn't exist, insert it at the top of the module
+    OpBuilder::InsertionGuard insertGuard(rewriter);
+    rewriter.setInsertionPointToStart(module.getBody());
+    return rewriter.create<LLVM::LLVMFuncOp>(module.getLoc(), name, type);
+}
+
+// ============================================================================
+// Existing Lowerings (BatchRead/Write)
+// ============================================================================
+
 struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
   using ConvertOpToLLVMPattern<io::BatchWriteOp>::ConvertOpToLLVMPattern;
 
@@ -21,36 +41,23 @@ struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
 
     auto module = op->getParentOfType<ModuleOp>();
 
-    // Ensure standard POSIX `write(int fd, void* buf, size_t count)` exists
-    auto writeFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("write");
-    if (!writeFunc) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
-      auto writeType = LLVM::LLVMFunctionType::get(
-          rewriter.getI64Type(),
-          {rewriter.getI32Type(), LLVM::LLVMPointerType::get(rewriter.getContext()), rewriter.getI64Type()}
-      );
-      writeFunc = rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), "write", writeType);
-    }
+    auto writeType = LLVM::LLVMFunctionType::get(
+        rewriter.getI64Type(),
+        {rewriter.getI32Type(), LLVM::LLVMPointerType::get(rewriter.getContext()), rewriter.getI64Type()}
+    );
+    auto writeFunc = getOrInsertFunc(rewriter, module, "write", writeType);
 
-    // Cast the MLIR types down to raw LLVM types
-    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
 
-    // Safely handle both MemRefs and raw LLVM Pointers
     Value rawPtr;
     if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
-        // It's a MemRef descriptor: extract the raw contiguous pointer
         rawPtr = getStridedElementPtr(rewriter, op.getLoc(), memrefType, adaptor.getBuffer(), {});
     } else {
-        // It's already a raw pointer (from C/C++ frontend)
         rawPtr = adaptor.getBuffer();
     }
 
-    // Emit the actual LLVM IR Call instruction
     auto llvmCall = rewriter.create<LLVM::CallOp>(
-        op.getLoc(),
-        writeFunc,
-        ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
+        op.getLoc(), writeFunc, ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
     );
 
     rewriter.replaceOp(op, llvmCall.getResult());
@@ -67,31 +74,20 @@ struct BatchWriteVLowering : public ConvertOpToLLVMPattern<io::BatchWriteVOp> {
     auto module = op->getParentOfType<ModuleOp>();
     MLIRContext *ctx = rewriter.getContext();
 
-    // Define the LLVM Types for `struct iovec { void *iov_base; size_t iov_len; }`
     Type voidPtrTy = LLVM::LLVMPointerType::get(ctx);
     Type sizeTy = rewriter.getI64Type();
     Type i32Ty = rewriter.getI32Type();
     Type iovecTy = LLVM::LLVMStructType::getLiteral(ctx, {voidPtrTy, sizeTy});
 
-    // Ensure the OS `writev` function is declared in the module
-    auto writevFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("writev");
-    if (!writevFunc) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
-      auto writevType = LLVM::LLVMFunctionType::get(
-          sizeTy, {i32Ty, voidPtrTy, i32Ty});
-      writevFunc = rewriter.create<LLVM::LLVMFuncOp>(loc, "writev", writevType);
-    }
+    auto writevType = LLVM::LLVMFunctionType::get(sizeTy, {i32Ty, voidPtrTy, i32Ty});
+    auto writevFunc = getOrInsertFunc(rewriter, module, "writev", writevType);
 
     Value fdI32 = adaptor.getFd();
-    
     Value vectorCountI32 = rewriter.create<LLVM::TruncOp>(loc, i32Ty, adaptor.getCount());
 
-    // Allocate the array of iovec structs on the stack
     Value iovecArrayPtr = rewriter.create<LLVM::AllocaOp>(
         loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
-    // Generate a loop to populate the iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     Value countIndex = op.getCount(); 
@@ -102,36 +98,26 @@ struct BatchWriteVLowering : public ConvertOpToLLVMPattern<io::BatchWriteVOp> {
     Value iv = loop.getInductionVar();
     Value ivI64 = rewriter.create<arith::IndexCastOp>(loc, sizeTy, iv);
 
-    // Load the pointer address as an i64
     Value ptrValI64 = rewriter.create<memref::LoadOp>(loc, op.getPtrs(), ValueRange{iv});
-    
-    // Explicitly cast the i64 back into an LLVM Pointer!
     Value ptrVal = rewriter.create<LLVM::IntToPtrOp>(loc, voidPtrTy, ptrValI64);
-    
-    // Load the size as normal
     Value sizeVal = rewriter.create<memref::LoadOp>(loc, op.getSizes(), ValueRange{iv});
 
-    // Get reference to iovecArray[iv]
     Value iovAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
 
-    // Store ptr into iovecArray[iv].iov_base (Index 0)
     Value iovBaseAddr = rewriter.create<LLVM::GEPOp>(
         loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
     rewriter.create<LLVM::StoreOp>(loc, ptrVal, iovBaseAddr);
 
-    // Store size into iovecArray[iv].iov_len (Index 1)
     Value iovLenAddr = rewriter.create<LLVM::GEPOp>(
         loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
     rewriter.create<LLVM::StoreOp>(loc, sizeVal, iovLenAddr);
 
     rewriter.setInsertionPointAfter(loop);
 
-    // Make the single, optimized system call
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         loc, writevFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
     rewriter.replaceOp(op, llvmCall.getResult());
-    
     return success();
   }
 };
@@ -143,37 +129,24 @@ struct BatchReadLowering : public ConvertOpToLLVMPattern<io::BatchReadOp> {
                                 ConversionPatternRewriter &rewriter) const override {
     auto module = op->getParentOfType<ModuleOp>();
 
-    // Ensure standard POSIX `read(int fd, void* buf, size_t count)` exists
-    auto readFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("read");
-    if (!readFunc) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
-      auto readType = LLVM::LLVMFunctionType::get(
-          rewriter.getI64Type(),
-          {rewriter.getI32Type(), LLVM::LLVMPointerType::get(rewriter.getContext()), rewriter.getI64Type()}
-      );
-      readFunc = LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), "read", readType);
-    }
+    auto readType = LLVM::LLVMFunctionType::get(
+        rewriter.getI64Type(),
+        {rewriter.getI32Type(), LLVM::LLVMPointerType::get(rewriter.getContext()), rewriter.getI64Type()}
+    );
+    auto readFunc = getOrInsertFunc(rewriter, module, "read", readType);
 
-    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
     
-    // Safely handle both MemRefs and raw LLVM Pointers
     Value rawPtr;
     if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
-        // It's a MemRef descriptor: extract the raw contiguous pointer
         rawPtr = getStridedElementPtr(rewriter, op.getLoc(), memrefType, adaptor.getBuffer(), {});
     } else {
-        // It's already a raw pointer (from C/C++ frontend)
         rawPtr = adaptor.getBuffer();
     }
 
-    auto llvmCall = LLVM::CallOp::create(
-        rewriter,
-        op.getLoc(),
-        readFunc,
-        ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
+    auto llvmCall = rewriter.create<LLVM::CallOp>(
+        op.getLoc(), readFunc, ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
     );
-
 
     rewriter.replaceOp(op, llvmCall.getResult());
     return success();
@@ -189,30 +162,20 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     auto module = op->getParentOfType<ModuleOp>();
     MLIRContext *ctx = rewriter.getContext();
 
-    // 1. Define LLVM Types (iovec { void*, size_t })
     Type voidPtrTy = LLVM::LLVMPointerType::get(ctx);
     Type sizeTy = rewriter.getI64Type();
     Type i32Ty = rewriter.getI32Type();
     Type iovecTy = LLVM::LLVMStructType::getLiteral(ctx, {voidPtrTy, sizeTy});
 
-    // 2. Ensure `readv` is declared (ssize_t readv(int fd, const struct iovec *iov, int iovcnt))
-    auto readvFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("readv");
-    if (!readvFunc) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
-      auto readvType = LLVM::LLVMFunctionType::get(sizeTy, {i32Ty, voidPtrTy, i32Ty});
-      readvFunc = rewriter.create<LLVM::LLVMFuncOp>(loc, "readv", readvType);
-    }
+    auto readvType = LLVM::LLVMFunctionType::get(sizeTy, {i32Ty, voidPtrTy, i32Ty});
+    auto readvFunc = getOrInsertFunc(rewriter, module, "readv", readvType);
 
-    // 3. Prepare arguments
     Value fdI32 = adaptor.getFd();
     Value vectorCountI32 = rewriter.create<LLVM::TruncOp>(loc, i32Ty, adaptor.getCount());
 
-    // 4. Allocate iovec array on stack
     Value iovecArrayPtr = rewriter.create<LLVM::AllocaOp>(
         loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
-    // 5. Setup loop to populate iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     Value countIndex = op.getCount(); 
@@ -223,38 +186,175 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     Value iv = loop.getInductionVar();
     Value ivI64 = rewriter.create<arith::IndexCastOp>(loc, sizeTy, iv);
 
-    // --- Synchronized MemRef Access (Same as WriteV) ---
-    // Load the pointer address (i64) and convert to LLVM Pointer
     Value ptrValI64 = rewriter.create<memref::LoadOp>(loc, op.getPtrs(), ValueRange{iv});
     Value ptrVal = rewriter.create<LLVM::IntToPtrOp>(loc, voidPtrTy, ptrValI64);
-    
-    // Load the size (i64)
     Value sizeVal = rewriter.create<memref::LoadOp>(loc, op.getSizes(), ValueRange{iv});
 
-    // 6. Populate iovec[iv]
     Value iovAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
 
-    // iovec[iv].iov_base
     Value iovBaseAddr = rewriter.create<LLVM::GEPOp>(
         loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
     rewriter.create<LLVM::StoreOp>(loc, ptrVal, iovBaseAddr);
 
-    // iovec[iv].iov_len
     Value iovLenAddr = rewriter.create<LLVM::GEPOp>(
         loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
     rewriter.create<LLVM::StoreOp>(loc, sizeVal, iovLenAddr);
 
     rewriter.setInsertionPointAfter(loop);
 
-    // 7. Make the system call
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         loc, readvFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
     rewriter.replaceOp(op, llvmCall.getResult());
-    
     return success();
   }
 };
+
+// ============================================================================
+// New Lowerings (Sendfile, Mmap, Prefetch, Submit, Wait)
+// ============================================================================
+
+struct SendfileLowering : public ConvertOpToLLVMPattern<io::SendfileOp> {
+    using ConvertOpToLLVMPattern<io::SendfileOp>::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(io::SendfileOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto module = op->getParentOfType<ModuleOp>();
+        auto *ctx = getContext();
+
+        auto i32Ty = IntegerType::get(ctx, 32);
+        auto i64Ty = IntegerType::get(ctx, 64);
+        auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+        
+        // ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+        auto funcTy = LLVM::LLVMFunctionType::get(i64Ty, {i32Ty, i32Ty, ptrTy, i64Ty});
+        
+        // Ensure function exists without triggering unused variable warnings
+        getOrInsertFunc(rewriter, module, "sendfile", funcTy);
+        
+        rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+            op, TypeRange{i64Ty}, SymbolRefAttr::get(ctx, "sendfile"), adaptor.getOperands());
+            
+        return success();
+    }
+};
+
+struct MmapLowering : public ConvertOpToLLVMPattern<io::MmapOp> {
+    using ConvertOpToLLVMPattern<io::MmapOp>::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(io::MmapOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto module = op->getParentOfType<ModuleOp>();
+        auto *ctx = getContext();
+        auto loc = op.getLoc();
+
+        auto i32Ty = IntegerType::get(ctx, 32);
+        auto i64Ty = IntegerType::get(ctx, 64);
+        auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+        
+        // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+        auto funcTy = LLVM::LLVMFunctionType::get(ptrTy, {ptrTy, i64Ty, i32Ty, i32Ty, i32Ty, i64Ty});
+        getOrInsertFunc(rewriter, module, "mmap", funcTy);
+
+        // POSIX mappings: PROT_READ = 1, MAP_PRIVATE = 2
+        Value nullPtr = rewriter.create<LLVM::ZeroOp>(loc, ptrTy);
+        Value protRead = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(1));
+        Value mapPrivate = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(2));
+        
+        SmallVector<Value> args = {
+            nullPtr, adaptor.getSize(), protRead, mapPrivate, adaptor.getFd(), adaptor.getOffset()
+        };
+        
+        rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+            op, TypeRange{ptrTy}, SymbolRefAttr::get(ctx, "mmap"), args);
+            
+        return success();
+    }
+};
+
+struct PrefetchLowering : public ConvertOpToLLVMPattern<io::PrefetchOp> {
+    using ConvertOpToLLVMPattern<io::PrefetchOp>::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(io::PrefetchOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto module = op->getParentOfType<ModuleOp>();
+        auto *ctx = getContext();
+        auto loc = op.getLoc();
+
+        auto i32Ty = IntegerType::get(ctx, 32);
+        auto i64Ty = IntegerType::get(ctx, 64);
+        
+        // int posix_fadvise(int fd, off_t offset, off_t len, int advice);
+        auto funcTy = LLVM::LLVMFunctionType::get(i32Ty, {i32Ty, i64Ty, i64Ty, i32Ty});
+        getOrInsertFunc(rewriter, module, "posix_fadvise", funcTy);
+
+        // POSIX mapping: POSIX_FADV_WILLNEED = 3
+        Value zeroOffset = rewriter.create<LLVM::ConstantOp>(loc, i64Ty, rewriter.getI64IntegerAttr(0));
+        Value advice = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(3));
+        
+        SmallVector<Value> args = {
+            adaptor.getFd(), zeroOffset, adaptor.getLookaheadSize(), advice
+        };
+        
+        // CRITICAL FIX: io.prefetch returns nothing, so we can't "replace" it with an i32.
+        // We create the call independently, then erase the prefetch op.
+        rewriter.create<LLVM::CallOp>(
+            loc, TypeRange{i32Ty}, SymbolRefAttr::get(ctx, "posix_fadvise"), args);
+        
+        rewriter.eraseOp(op);
+            
+        return success();
+    }
+};
+
+struct SubmitLowering : public ConvertOpToLLVMPattern<io::SubmitOp> {
+    using ConvertOpToLLVMPattern<io::SubmitOp>::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(io::SubmitOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto module = op->getParentOfType<ModuleOp>();
+        auto loc = op.getLoc();
+
+        auto readType = LLVM::LLVMFunctionType::get(
+            rewriter.getI64Type(),
+            {rewriter.getI32Type(), LLVM::LLVMPointerType::get(rewriter.getContext()), rewriter.getI64Type()}
+        );
+        getOrInsertFunc(rewriter, module, "read", readType);
+
+        // CRITICAL FIX: Handle MemRefs safely for submit buffers!
+        Value rawPtr;
+        if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
+            rawPtr = getStridedElementPtr(rewriter, loc, memrefType, adaptor.getBuffer(), {});
+        } else {
+            rawPtr = adaptor.getBuffer();
+        }
+
+        auto llvmCall = rewriter.create<LLVM::CallOp>(
+            loc, TypeRange{rewriter.getI64Type()}, SymbolRefAttr::get(rewriter.getContext(), "read"), 
+            ValueRange{adaptor.getFd(), rawPtr, adaptor.getSize()}
+        );
+
+        // The ticket is returned as an i32, so truncate the i64 bytes read.
+        rewriter.replaceOpWithNewOp<LLVM::TruncOp>(op, rewriter.getI32Type(), llvmCall.getResult());
+        return success();
+    }
+};
+
+struct WaitLowering : public ConvertOpToLLVMPattern<io::WaitOp> {
+    using ConvertOpToLLVMPattern<io::WaitOp>::ConvertOpToLLVMPattern;
+
+    LogicalResult matchAndRewrite(io::WaitOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // Fallback: The read was already executed synchronously in Submit. 
+        // We just cast the ticket (i32) back to bytes read (i64).
+        rewriter.replaceOpWithNewOp<LLVM::SExtOp>(op, rewriter.getI64Type(), adaptor.getTicket());
+        return success();
+    }
+};
+
+// ============================================================================
+// The Pass Registration
+// ============================================================================
 
 struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertIOToLLVMPass)
@@ -274,9 +374,7 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
 
     mlir::io::bootstrapTargetInfo(module);
 
-
     MLIRContext *context = &getContext();
-
     LLVMTypeConverter typeConverter(context);
 
     ConversionTarget target(*context);
@@ -286,16 +384,31 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
     target.addLegalDialect<arith::ArithDialect>(); 
     target.addLegalOp<io::IOCastOp>();
 
+    // Declare all IO dialect operations illegal to enforce lowering
     target.addIllegalOp<io::BatchWriteOp>();
     target.addIllegalOp<io::BatchWriteVOp>();
     target.addIllegalOp<io::BatchReadOp>();
     target.addIllegalOp<io::BatchReadVOp>();
+    target.addIllegalOp<io::SendfileOp>();
+    target.addIllegalOp<io::MmapOp>();
+    target.addIllegalOp<io::PrefetchOp>();
+    target.addIllegalOp<io::SubmitOp>();
+    target.addIllegalOp<io::WaitOp>();
 
     RewritePatternSet patterns(context);
+    
+    // Existing patterns
     patterns.add<BatchWriteLowering>(typeConverter);
     patterns.add<BatchWriteVLowering>(typeConverter);
     patterns.add<BatchReadLowering>(typeConverter);
     patterns.add<BatchReadVLowering>(typeConverter); 
+    
+    // New Advanced I/O patterns
+    patterns.add<SendfileLowering>(typeConverter);
+    patterns.add<MmapLowering>(typeConverter);
+    patterns.add<PrefetchLowering>(typeConverter);
+    patterns.add<SubmitLowering>(typeConverter);
+    patterns.add<WaitLowering>(typeConverter);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       signalPassFailure();
