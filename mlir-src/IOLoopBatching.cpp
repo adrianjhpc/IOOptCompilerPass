@@ -276,31 +276,33 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     Value fdStash = rewriter.create<memref::AllocaOp>(loc, fdStashType);
 
     // --- PHASE 2: INSIDE THE LOOP ---
-    rewriter.setInsertionPoint(ioCall);
+    rewriter.modifyOpInPlace(forOp, [&]() {
+        rewriter.setInsertionPoint(ioCall);
 
-    Value fdArg = ioCall.getOperand(0);
-    Value bufArg = ioCall.getOperand(1);
-    Value lenArg = ioCall.getOperand(2);
+        Value fdArg = ioCall.getOperand(0);
+        Value bufArg = ioCall.getOperand(1);
+        Value lenArg = ioCall.getOperand(2);
 
-    Value stdFd = rewriter.create<io::IOCastOp>(loc, stdI32Ty, fdArg);
-    Value stdBuf = rewriter.create<io::IOCastOp>(loc, stdI64Ty, bufArg);
-    Value stdLen = rewriter.create<io::IOCastOp>(loc, stdI64Ty, lenArg);
+        Value stdFd = rewriter.create<io::IOCastOp>(loc, stdI32Ty, fdArg);
+        Value stdBuf = rewriter.create<io::IOCastOp>(loc, stdI64Ty, bufArg);
+        Value stdLen = rewriter.create<io::IOCastOp>(loc, stdI64Ty, lenArg);
 
-    // Store FD in our stash
-    rewriter.create<memref::StoreOp>(loc, stdFd, fdStash, ValueRange{zeroIdx});
+        // Store FD in our stash
+        rewriter.create<memref::StoreOp>(loc, stdFd, fdStash, ValueRange{zeroIdx});
 
-    // Store buffer and length into our arrays
-    Value currentIdx = rewriter.create<memref::LoadOp>(loc, idxAlloca, ValueRange{zeroIdx});
-    rewriter.create<memref::StoreOp>(loc, stdBuf, ptrsMemref, ValueRange{currentIdx});
-    rewriter.create<memref::StoreOp>(loc, stdLen, sizesMemref, ValueRange{currentIdx});
+        // Store buffer and length into our arrays
+        Value currentIdx = rewriter.create<memref::LoadOp>(loc, idxAlloca, ValueRange{zeroIdx});
+        rewriter.create<memref::StoreOp>(loc, stdBuf, ptrsMemref, ValueRange{currentIdx});
+        rewriter.create<memref::StoreOp>(loc, stdLen, sizesMemref, ValueRange{currentIdx});
 
-    // Increment index
-    Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, (int64_t)1);
-    Value nextIdx = rewriter.create<arith::AddIOp>(loc, currentIdx, oneIdx);
-    rewriter.create<memref::StoreOp>(loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
+        // Increment index
+        Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, (int64_t)1);
+        Value nextIdx = rewriter.create<arith::AddIOp>(loc, currentIdx, oneIdx);
+        rewriter.create<memref::StoreOp>(loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
 
-    // Delete the original write
-    rewriter.eraseOp(ioCall);
+        // Delete the original write
+        rewriter.eraseOp(ioCall);
+    });
 
     // --- PHASE 3: POST-LOOP ---
     rewriter.setInsertionPointAfter(forOp);
@@ -509,8 +511,10 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
     // Clean up the original loop
     // Replace the slow I/O calls inside the loop with just the expected byte count,
     // leaving the processing logic completely intact to run against the now-populated memory
-    rewriter.setInsertionPoint(readOp);
-    rewriter.replaceOp(readOp, readOp.getSize());
+    rewriter.modifyOpInPlace(loop, [&]() {
+        rewriter.setInsertionPoint(readOp);
+        rewriter.replaceOp(readOp, readOp.getSize());
+    });
 
     return success();
   }

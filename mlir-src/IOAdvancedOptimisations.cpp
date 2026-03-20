@@ -20,19 +20,22 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
     PromoteToZeroCopyPattern(MLIRContext *context)
         : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/2, context) {}
 
-   LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-        auto readCall = dyn_cast<CallOpInterface>(op);
+
+    LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
+        // Use func::CallOp instead of CallOpInterface
+        auto readCall = dyn_cast<func::CallOp>(op);
         if (!readCall) return failure();
 
-        auto calleeAttr = dyn_cast<SymbolRefAttr>(readCall.getCallableForCallee());
-        if (!calleeAttr || calleeAttr.getRootReference() != "read") return failure();
-        
-        if (readCall.getArgOperands().size() != 3) return failure();
+        // Use the robust getCallee() string matcher
+        StringRef callee = readCall.getCallee();
+        if (callee != "read" && callee != "read64" && callee != "read32") return failure();
+        if (readCall.getNumOperands() != 3) return failure();
         
         llvm::errs() << "[IOOpt-Telemetry] Found 'read' call. Scanning block...\n";
         
-        Value fdIn = readCall.getArgOperands()[0];
-        Value readSize = readCall.getArgOperands()[2];
+        // Use getOperand() instead of getArgOperands()
+        Value fdIn = readCall.getOperand(0);
+        Value readSize = readCall.getOperand(2);
 
         // Hardened to trace through array indexing and pointer math
         auto getRootAllocation = [](Value v) {
@@ -46,19 +49,20 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
                 }
             }
             return v;
-        };        
+        };  
 
-        Value readBufferRoot = getRootAllocation(readCall.getArgOperands()[1]);
+        Value readBufferRoot = getRootAllocation(readCall.getOperand(1));
 
-        CallOpInterface writeCall = nullptr;
+        func::CallOp writeCall = nullptr;
         
         for (Operation *nextOp = op->getNextNode(); nextOp != nullptr; nextOp = nextOp->getNextNode()) {
             
-            if (auto maybeWrite = dyn_cast<CallOpInterface>(nextOp)) {
-                auto nextCallee = dyn_cast<SymbolRefAttr>(maybeWrite.getCallableForCallee());
-                if (nextCallee && nextCallee.getRootReference() == "write") {
-                    if (maybeWrite.getArgOperands().size() == 3) {
-                        Value writeBufferRoot = getRootAllocation(maybeWrite.getArgOperands()[1]);
+            // Apply the same robust matching to the Write call
+            if (auto maybeWrite = dyn_cast<func::CallOp>(nextOp)) {
+                StringRef nextCallee = maybeWrite.getCallee();
+                if (nextCallee == "write" || nextCallee == "write64" || nextCallee == "write32") {
+                    if (maybeWrite.getNumOperands() == 3) {
+                        Value writeBufferRoot = getRootAllocation(maybeWrite.getOperand(1));
                         if (readBufferRoot == writeBufferRoot) {
                             writeCall = maybeWrite;
                             break; 
@@ -98,17 +102,16 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
             return failure();
         }
 
-        Value fdOut = writeCall.getArgOperands()[0];
-        Value writeSize = writeCall.getArgOperands()[2];
+        Value fdOut = writeCall.getOperand(0);
+        Value writeSize = writeCall.getOperand(2);
 
         if (getRootAllocation(readSize) != getRootAllocation(writeSize)) {
             llvm::errs() << "[IOOpt-Telemetry] Abort: Size variables do not match.\n";
             return failure();
         }
 
-        // The Rewrite
         rewriter.setInsertionPoint(writeCall);
-        Value nullOffset = readCall.getArgOperands()[1]; 
+        Value nullOffset = readCall.getOperand(1);
 
         auto sendfileOp = mlir::io::SendfileOp::create(
             rewriter,
@@ -169,25 +172,24 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
         // --------------------------------------------------------------------
         // Step 1: PRE-PASS (Steal types and inject ioopt_writev_* intrinsics)
         // --------------------------------------------------------------------
-        CallOpInterface firstWrite = nullptr;
-        module.walk([&](CallOpInterface call) {
-            auto callee = dyn_cast<SymbolRefAttr>(call.getCallableForCallee());
-            if (callee && callee.getRootReference() == "write" && call.getArgOperands().size() == 3) {
+        func::CallOp firstWrite = nullptr;
+        module.walk([&](func::CallOp call) {
+            StringRef callee = call.getCallee();
+            if ((callee == "write" || callee == "write64" || callee == "write32") && call.getNumOperands() == 3) {
                 firstWrite = call;
                 return WalkResult::interrupt();
             }
             return WalkResult::advance();
         });
 
-        // If there are no writes in this module, just exit early!
         if (!firstWrite) return;
 
         OpBuilder builder(module.getBodyRegion());
-        Type fdType = firstWrite.getArgOperands()[0].getType();
-        Type ptrType = firstWrite.getArgOperands()[1].getType(); 
-        Type sizeType = firstWrite.getArgOperands()[2].getType();
-        Type retType = firstWrite->getResultTypes()[0];
-        
+        Type fdType = firstWrite.getOperand(0).getType();
+        Type ptrType = firstWrite.getOperand(1).getType(); 
+        Type sizeType = firstWrite.getOperand(2).getType();
+        Type retType = firstWrite->getResultTypes()[0];       
+ 
         for (int i = 2; i <= 4; ++i) {
             std::string funcName = "ioopt_writev_" + std::to_string(i);
             if (!module.lookupSymbol(funcName)) {
@@ -230,11 +232,11 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
                 Operation *op = &opRef;
                 
                 // If we find a write, check if we can add it to the current batch
-                if (auto call = dyn_cast<CallOpInterface>(op)) {
-                    auto callee = dyn_cast<SymbolRefAttr>(call.getCallableForCallee());
-                    if (callee && callee.getRootReference() == "write" && call.getArgOperands().size() == 3) {
-                        Value fdRoot = getRootAllocation(call.getArgOperands()[0]);
-                        
+                if (auto call = dyn_cast<func::CallOp>(op)) {
+                    StringRef callee = call.getCallee();
+                    if ((callee == "write" || callee == "write64" || callee == "write32") && call.getNumOperands() == 3) {
+                        Value fdRoot = getRootAllocation(call.getOperand(0));
+ 
                         if (currentBatch.empty()) {
                             currentBatch.push_back(op);
                             currentFdRoot = fdRoot;
@@ -285,14 +287,14 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
             std::string funcName = "ioopt_writev_" + std::to_string(batch.size());
             
             SmallVector<Value, 9> newArgs;
-            auto firstWriteInBatch = cast<CallOpInterface>(batch[0]);
+            auto firstWriteInBatch = cast<func::CallOp>(batch[0]);
             
-            newArgs.push_back(firstWriteInBatch.getArgOperands()[0]); // Shared FD
+            newArgs.push_back(firstWriteInBatch.getOperand(0)); // Shared FD
             
             for (Operation *w : batch) {
-                auto wCall = cast<CallOpInterface>(w);
-                newArgs.push_back(wCall.getArgOperands()[1]); // Buffer
-                newArgs.push_back(wCall.getArgOperands()[2]); // Size
+                auto wCall = cast<func::CallOp>(w);
+                newArgs.push_back(wCall.getOperand(1)); // Buffer
+                newArgs.push_back(wCall.getOperand(2)); // Size
             }
 
             auto writevCall = func::CallOp::create(
