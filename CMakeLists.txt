@@ -126,6 +126,7 @@ enable_testing()
 
 add_subdirectory(runtime_src)
 add_subdirectory(llvm-src)
+add_subdirectory(llvm-tests)
 add_subdirectory(benchmarks)
 add_subdirectory(mlir-src)
 add_subdirectory(mlir-tests)
