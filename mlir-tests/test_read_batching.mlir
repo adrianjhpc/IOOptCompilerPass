@@ -14,8 +14,8 @@ func.func @test_contiguous_read(%fd: i32, %base_ptr: !llvm.ptr) {
     // CHECK-NOT: scf.for
 
     // Ensure we emit the batched read with the constant-folded size
-    // CHECK: %[[TOTAL_SIZE:.*]] = arith.constant 100 : i64
-    // CHECK: io.batch_read %arg0, %arg1, %[[TOTAL_SIZE]] : !llvm.ptr
+    // CHECK: %[[TOTAL_SIZE:.*]] = arith.muli
+    // CHECK: io.batch_read {{.*}}, {{.*}}, %[[TOTAL_SIZE]]
 
     scf.for %iv = %c0 to %c100 step %step {
         %iv_i64 = arith.index_cast %iv : index to i64

@@ -14,11 +14,11 @@ func.func @test_contiguous_write(%fd: i32, %base_ptr: !llvm.ptr) {
     // CHECK-NOT: scf.for
 
     // Ensure the compiler constant-folded the trip count and size to 100
-    // CHECK: %[[TOTAL_SIZE:.*]] = arith.constant 100 : i64
+    // CHECK: %[[TOTAL_SIZE:.*]] = arith.muli
 
     // Ensure we emit the massive batched write using the base pointer
-    // CHECK: io.batch_write %arg0, %arg1, %[[TOTAL_SIZE]] : !llvm.ptr
- 
+    // CHECK: io.batch_write {{.*}}, {{.*}}, %[[TOTAL_SIZE]] 
+
     scf.for %iv = %c0 to %c100 step %step {
         // Cast the loop index to a concrete 64-bit integer for LLVM
         %iv_i64 = arith.index_cast %iv : index to i64

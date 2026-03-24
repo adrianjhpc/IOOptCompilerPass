@@ -158,34 +158,144 @@ static bool isContiguousMemoryAccess(Value buffer, scf::ForOp loop, Value writeS
 // Target cir::ForOp directly to bypass any broken interfaces!
 struct CirLoopBatchingPattern {
   static LogicalResult matchAndRewrite(cir::ForOp forOp, IRRewriter &rewriter) {    
-    llvm::errs() << "[IOOpt] Found a cir::ForOp! Analyzing...\n";
-
     Region &bodyRegion = forOp.getBody();
     Region &condRegion = forOp.getCond();
 
-    // 1. Find the read() or write() call
+    // 1. Find the I/O call
     cir::CallOp ioCall = nullptr;
-    bool isRead = false; // Flag to tell Phase 3 which operation to generate
+    bool isRead = false; 
+    bool isPositional = false;
+    bool isVFD = false;
+    StringRef detectedFuncName = "";
 
     bodyRegion.walk([&](cir::CallOp call) {
       if (auto calleeAttr = call->getAttrOfType<FlatSymbolRefAttr>("callee")) {
         StringRef funcName = calleeAttr.getValue();
-        // Check for either write or read
-        if (funcName.starts_with("write") || funcName.starts_with("read")) {
+        
+        if (funcName == "write" || funcName == "read" ||
+            funcName == "pwrite" || funcName == "pread" ||
+            funcName == "FileWrite" || funcName == "FileRead") {
+            
           ioCall = call;
-          isRead = funcName.starts_with("read"); // True if read, false if write
+          detectedFuncName = funcName;
+          isRead = funcName.contains("ead"); // Matches read, pread, FileRead
+          isPositional = funcName.starts_with("p") || funcName.starts_with("File");
+          isVFD = funcName.starts_with("File");
+          
           return WalkResult::interrupt();
         }
       }
       return WalkResult::advance();
     });
 
-    if (!ioCall) {
-      llvm::errs() << "[IOOpt] Bailing out: No 'write' or 'read' call found in loop body.\n";
-      return failure();
-    }
+    if (!ioCall) return failure();
     
-    llvm::errs() << "[IOOpt] Success: Found " << (isRead ? "read" : "write") << " call!\n";
+    llvm::errs() << "\n[IOOpt] Analyzing loop containing: " << detectedFuncName << "\n";
+
+    // --- SAFETY LOCK 1: VFD GUARD ---
+    if (isVFD) {
+        llvm::errs() << "[IOOpt] ABORT: '" << detectedFuncName << "' uses a PostgreSQL Virtual File Descriptor (VFD).\n";
+        llvm::errs() << "        Passing this to a Linux writev() syscall will result in EBADF.\n";
+        return failure();
+    }
+
+    // --- SAFETY LOCK 2: POSITIONAL OFFSET GUARD & SCEV ---
+    Value initialOffsetForSyscall = nullptr;
+
+    if (isPositional) {
+        if (ioCall.getNumOperands() < 4) {
+            llvm::errs() << "[IOOpt] ABORT: Positional I/O detected but missing offset operand.\n";
+            return failure();
+        }
+        
+        Value offsetArg = ioCall.getOperand(3);
+        Value sizeArg = ioCall.getOperand(2);
+
+        // Helper: Strip away CIR casts to see the raw underlying value
+        auto stripCasts = [](Value val) -> Value {
+            while (auto cast = val.getDefiningOp<cir::CastOp>()) {
+                val = cast.getSrc();
+            }
+            return val;
+        };
+
+        // Helper: Find the original stack allocation (cir.alloca) for a loaded variable
+        auto getBackingAlloca = [&](Value v) -> Operation* {
+            v = stripCasts(v);
+            if (auto loadOp = v.getDefiningOp<cir::LoadOp>()) {
+                return loadOp.getAddr().getDefiningOp();
+            }
+            return nullptr;
+        };
+
+        Operation* offsetAlloc = getBackingAlloca(offsetArg);
+        if (!offsetAlloc || !isa<cir::AllocaOp>(offsetAlloc)) {
+            llvm::errs() << "[IOOpt] ABORT: Offset is not a traceable local variable.\n";
+            return failure();
+        }
+        Value offsetPtr = offsetAlloc->getResult(0);
+
+        // Scan the loop body for EVERY time the offset variable is mutated
+        SmallVector<cir::StoreOp, 2> offsetMutations;
+        forOp.walk([&](cir::StoreOp store) {
+            if (store.getAddr() == offsetPtr) {
+                offsetMutations.push_back(store);
+            }
+        });
+
+        // To be perfectly contiguous, it must advance exactly once per loop iteration
+        if (offsetMutations.size() != 1) {
+            llvm::errs() << "[IOOpt] ABORT: Offset is mutated multiple times or not at all (Random Access).\n";
+            return failure();
+        }
+
+        cir::StoreOp offsetUpdate = offsetMutations.front();
+        Value storedVal = stripCasts(offsetUpdate.getValue());
+
+        // The mutation MUST be an addition
+        auto addOp = storedVal.getDefiningOp<cir::BinOp>();
+        if (!addOp || addOp.getKind() != cir::BinOpKind::Add) {
+            llvm::errs() << "[IOOpt] ABORT: Offset mutation is not an addition.\n";
+            return failure();
+        }
+
+        Value lhs = stripCasts(addOp.getLhs());
+        Value rhs = stripCasts(addOp.getRhs());
+
+        // Check if a value is a load of our offset pointer
+        auto isLoadOfOffset = [&](Value v) {
+            if (auto load = v.getDefiningOp<cir::LoadOp>()) {
+                return load.getAddr() == offsetPtr;
+            }
+            return false;
+        };
+
+        // Check if a value perfectly matches the size argument of the I/O call
+        auto isSizeEquivalence = [&](Value v) {
+            return v == stripCasts(sizeArg);
+        };
+
+        // Prove: Offset_Next = Offset_Current + Size (or Size + Offset_Current)
+        bool validAdvancement = (isLoadOfOffset(lhs) && isSizeEquivalence(rhs)) ||
+                                (isLoadOfOffset(rhs) && isSizeEquivalence(lhs));
+
+        if (!validAdvancement) {
+            llvm::errs() << "[IOOpt] ABORT: Offset does not advance perfectly contiguously by 'size'.\n";
+            return failure();
+        }
+
+        // We successfully proved contiguity
+        // We must capture the value of the offset BEFORE the loop starts to pass to preadv/pwritev
+        rewriter.setInsertionPoint(forOp);
+        initialOffsetForSyscall = cir::LoadOp::create(
+            rewriter,
+            forOp.getLoc(), 
+            mlir::cast<cir::PointerType>(offsetPtr.getType()).getPointee(), 
+            offsetPtr
+        );
+
+        llvm::errs() << "[IOOpt] SUCCESS: Positional offset mathematically proven to be contiguous!\n";
+    }
 
     // 2. Extract Upper Bound
     int64_t upperBound = -1;
@@ -200,25 +310,18 @@ struct CirLoopBatchingPattern {
       }
     });
 
-    if (upperBound <= 1) {
-      llvm::errs() << "[IOOpt] Bailing out: Upper bound is " << upperBound << " (Needs to be > 1).\n";
-      return failure();
-    }
+    if (upperBound <= 1) return failure();
 
     // 3. Extract Step Value
-    int64_t stepValue = 1; // Default to 1
-    bool isValidStep = false; // Assume invalid until proven safe
+    int64_t stepValue = 1; 
+    bool isValidStep = false; 
 
     Region &stepRegion = forOp.getStep();
     stepRegion.walk([&](cir::BinOp binOp) {
-      // If this is not an addition operation, we abort the walk
-      // (cir::BinOpKind::add is the standard ODS-generated enum for cir.binop)
       if (binOp.getKind() != cir::BinOpKind::Add) {
         isValidStep = false;
-        return WalkResult::interrupt(); // Stops the walk immediately
+        return WalkResult::interrupt(); 
       }
-
-      // It is a safe addition. Now extract the constant operand.
       if (auto constOp = binOp.getOperand(1).getDefiningOp<cir::ConstantOp>()) {
         auto attr = constOp.getValue();
         if (auto cirInt = mlir::dyn_cast<cir::IntAttr>(attr)) {
@@ -229,22 +332,13 @@ struct CirLoopBatchingPattern {
           isValidStep = true;
         }
       }
-      return WalkResult::advance(); // Keep walking (or finish)
+      return WalkResult::advance(); 
     });
 
-    // If the walk was interrupted by a bad math operation, or no constant was found, bail out
-    if (!isValidStep) {
-      llvm::errs() << "[IOOpt] Bailing out: Loop step is not a simple addition, or constant is missing.\n";
-      return failure();
-    }
+    if (!isValidStep) return failure();
 
-    // 4. Calculate True Trip Count
     int64_t lowerBound = 0; 
     int64_t tripCount = (upperBound - lowerBound + stepValue - 1) / stepValue;
-
-    llvm::errs() << "[IOOpt] Extracted Upper Bound: " << upperBound << "\n";
-    llvm::errs() << "[IOOpt] Extracted Step: " << stepValue << "\n";
-    llvm::errs() << "[IOOpt] True Trip Count: " << tripCount << "\n";
 
     // --- PHASE 1: PRE-LOOP ALLOCATIONS ---
     Location loc = forOp.getLoc();
@@ -256,20 +350,17 @@ struct CirLoopBatchingPattern {
     auto stdI32Ty = rewriter.getI32Type();
     auto stdI64Ty = rewriter.getI64Type();
     
-    // Allocate the arrays for pointers (as i64) and sizes (as i64)
     auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, stdI64Ty);
     auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, stdI64Ty);
 
     Value ptrsMemref = memref::AllocaOp::create(rewriter, loc, ptrArrayType, ValueRange{tripCountVal});
     Value sizesMemref = memref::AllocaOp::create(rewriter, loc, sizeArrayType, ValueRange{tripCountVal});
 
-    // Allocate the index tracker
     auto idxArrayType = MemRefType::get({1}, rewriter.getIndexType());
     Value idxAlloca = memref::AllocaOp::create(rewriter, loc, idxArrayType);
     Value zeroIdx = arith::ConstantIndexOp::create(rewriter, loc, (int64_t)0);
     memref::StoreOp::create(rewriter, loc, zeroIdx, idxAlloca, ValueRange{zeroIdx});
 
-    // Allocate a 1-element stash to smuggle the FD out of the loop
     auto fdStashType = MemRefType::get({1}, stdI32Ty);
     Value fdStash = memref::AllocaOp::create(rewriter, loc, fdStashType);
 
@@ -285,27 +376,21 @@ struct CirLoopBatchingPattern {
         Value stdBuf = io::IOCastOp::create(rewriter, loc, stdI64Ty, bufArg);
         Value stdLen = io::IOCastOp::create(rewriter, loc, stdI64Ty, lenArg);
 
-        // Store FD in our stash
         memref::StoreOp::create(rewriter, loc, stdFd, fdStash, ValueRange{zeroIdx});
 
-        // Store buffer and length into our arrays
         Value currentIdx = memref::LoadOp::create(rewriter, loc, idxAlloca, ValueRange{zeroIdx});
         memref::StoreOp::create(rewriter, loc, stdBuf, ptrsMemref, ValueRange{currentIdx});
         memref::StoreOp::create(rewriter, loc, stdLen, sizesMemref, ValueRange{currentIdx});
 
-        // Increment index
         Value oneIdx = arith::ConstantIndexOp::create(rewriter, loc, (int64_t)1);
         Value nextIdx = arith::AddIOp::create(rewriter, loc, currentIdx, oneIdx);
         memref::StoreOp::create(rewriter, loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
 
-        // Delete the original write
         rewriter.eraseOp(ioCall);
     });
 
     // --- PHASE 3: POST-LOOP ---
     rewriter.setInsertionPointAfter(forOp);
-
-    // Retrieve the smuggled FD
     Value finalFd = memref::LoadOp::create(rewriter, loc, fdStash, ValueRange{zeroIdx});
 
     if (isRead) {
@@ -343,18 +428,31 @@ struct HoistWriteLoopPattern {
     if (hasSideEffects || !writeOp) return failure();
     if (!loop.isDefinedOutsideOfLoop(writeOp.getFd())) return failure();
 
+
+    rewriter.setInsertionPoint(loop);
+
     Location loc = loop.getLoc();
     Value diff = arith::SubIOp::create(rewriter, loc, loop.getUpperBound(), loop.getLowerBound());
     Value tripCount = arith::DivSIOp::create(rewriter, loc, diff, loop.getStep());
     Value tripCountI64 = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(), tripCount);
 
-    rewriter.setInsertionPoint(loop);
+    // Safe Size Hoisting 
+    Value safeSize = writeOp.getSize();
+    if (!loop.isDefinedOutsideOfLoop(safeSize)) {
+        Operation *defOp = safeSize.getDefiningOp();
+        if (defOp && defOp->hasTrait<OpTrait::ConstantLike>()) {
+            // Clone the constant outside the loop so it survives deletion
+            safeSize = rewriter.clone(*defOp)->getResult(0);
+        } else {
+            return failure();
+        }
+    }
 
     // Contiguous vs Vector Routing
     Value basePointer;
-    if (isContiguousMemoryAccess(writeOp.getBuffer(), loop, writeOp.getSize(), basePointer)) {
-        // Contigious writes
-        Value totalSize = arith::MulIOp::create(rewriter, loc, tripCountI64, writeOp.getSize());
+    if (isContiguousMemoryAccess(writeOp.getBuffer(), loop, safeSize, basePointer)) {
+        // Contiguous writes (Use safeSize!)
+        Value totalSize = arith::MulIOp::create(rewriter, loc, tripCountI64, safeSize);
         io::BatchWriteOp::create(rewriter, loc, rewriter.getI64Type(), writeOp.getFd(), basePointer, totalSize);
     } else {
         // Fallback to scattered writes (writev) 
@@ -364,16 +462,13 @@ struct HoistWriteLoopPattern {
         Value ptrsMemref = memref::AllocaOp::create(rewriter, loc, ptrArrayType, tripCount);
         Value sizesMemref = memref::AllocaOp::create(rewriter, loc, sizeArrayType, tripCount);
 
-        // Build a new loop just to calculate the addresses
         auto calcLoop = scf::ForOp::create(rewriter, loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
         rewriter.setInsertionPointToStart(calcLoop.getBody());
 
         Value currentIV = calcLoop.getInductionVar();
         Value ivOffset = arith::SubIOp::create(rewriter, loc, currentIV, loop.getLowerBound());
         Value arrayIdx = arith::DivSIOp::create(rewriter, loc, ivOffset, loop.getStep());
-        Value arrayIdxCast = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), arrayIdx);
-
-        // Clone the address calculations
+        
         IRMapping mapping;
         mapping.map(loop.getInductionVar(), currentIV);
         for (Operation &op : *body) {
@@ -384,10 +479,10 @@ struct HoistWriteLoopPattern {
         Value mappedBuffer = mapping.lookupOrDefault(writeOp.getBuffer());
         Value mappedSize = mapping.lookupOrDefault(writeOp.getSize());
         
-        memref::StoreOp::create(rewriter, loc, mappedBuffer, ptrsMemref, arrayIdxCast);
-        memref::StoreOp::create(rewriter, loc, mappedSize, sizesMemref, arrayIdxCast);
+        // Use arrayIdx directly
+        memref::StoreOp::create(rewriter, loc, mappedBuffer, ptrsMemref, arrayIdx);
+        memref::StoreOp::create(rewriter, loc, mappedSize, sizesMemref, arrayIdx);
 
-        // Emit the batched scatter operation after the calculation loop
         rewriter.setInsertionPointAfter(calcLoop);
         io::BatchWriteVOp::create(rewriter, loc, rewriter.getI64Type(), writeOp.getFd(), ptrsMemref, sizesMemref, tripCount);
     }
@@ -446,17 +541,27 @@ struct HoistReadLoopPattern {
       }
     }
 
+    rewriter.setInsertionPoint(loop);
+
     Location loc = loop.getLoc();
     Value diff = arith::SubIOp::create(rewriter, loc, loop.getUpperBound(), loop.getLowerBound());
     Value tripCount = arith::DivSIOp::create(rewriter, loc, diff, loop.getStep());
     Value tripCountI64 = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(), tripCount);
 
-    rewriter.setInsertionPoint(loop);
+    Value safeSize = readOp.getSize();
+    if (!loop.isDefinedOutsideOfLoop(safeSize)) {
+        Operation *defOp = safeSize.getDefiningOp();
+        if (defOp && defOp->hasTrait<OpTrait::ConstantLike>()) {
+            safeSize = rewriter.clone(*defOp)->getResult(0);
+        } else {
+            return failure();
+        }
+    }
 
     // Contiguous vs Vector Routing
     Value basePointer;
-    if (isContiguousMemoryAccess(readOp.getBuffer(), loop, readOp.getSize(), basePointer)) {
-        Value totalSize = arith::MulIOp::create(rewriter, loc, tripCountI64, readOp.getSize());
+    if (isContiguousMemoryAccess(readOp.getBuffer(), loop, safeSize, basePointer)) {
+        Value totalSize = arith::MulIOp::create(rewriter, loc, tripCountI64, safeSize);
         io::BatchReadOp::create(rewriter, loc, rewriter.getI64Type(), readOp.getFd(), basePointer, totalSize);
     } else {
         auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, readOp.getBuffer().getType());
@@ -471,7 +576,6 @@ struct HoistReadLoopPattern {
         Value currentIV = calcLoop.getInductionVar();
         Value ivOffset = arith::SubIOp::create(rewriter, loc, currentIV, loop.getLowerBound());
         Value arrayIdx = arith::DivSIOp::create(rewriter, loc, ivOffset, loop.getStep());
-        Value arrayIdxCast = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), arrayIdx);
 
         IRMapping mapping;
         mapping.map(loop.getInductionVar(), currentIV);
@@ -485,8 +589,9 @@ struct HoistReadLoopPattern {
         Value mappedBuffer = mapping.lookupOrDefault(readOp.getBuffer());
         Value mappedSize = mapping.lookupOrDefault(readOp.getSize());
         
-        memref::StoreOp::create(rewriter, loc, mappedBuffer, ptrsMemref, arrayIdxCast);
-        memref::StoreOp::create(rewriter, loc, mappedSize, sizesMemref, arrayIdxCast);
+        // Use arrayIdx directly
+        memref::StoreOp::create(rewriter, loc, mappedBuffer, ptrsMemref, arrayIdx);
+        memref::StoreOp::create(rewriter, loc, mappedSize, sizesMemref, arrayIdx);
 
         rewriter.setInsertionPoint(loop); 
         io::BatchReadVOp::create(rewriter, loc, rewriter.getI64Type(), readOp.getFd(), ptrsMemref, sizesMemref, tripCount);
@@ -494,7 +599,7 @@ struct HoistReadLoopPattern {
 
     rewriter.modifyOpInPlace(loop, [&]() {
         rewriter.setInsertionPoint(readOp);
-        rewriter.replaceOp(readOp, readOp.getSize());
+        rewriter.replaceOp(readOp, safeSize);
     });
 
     return success();
