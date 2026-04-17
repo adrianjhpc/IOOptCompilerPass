@@ -671,9 +671,9 @@ namespace {
     for (CallInst *C : Batch) {
         Value *L = getIOArguments(C).Length;
         if (L && L->getType() != TotalDynLen->getType()) L = InsertBuilder.CreateZExtOrTrunc(L, TotalDynLen->getType());
-        if (L) TotalDynLen = InsertBuilder.CreateAdd(TotalDynLen, L, "dyn.len.add", true, true); 
-    }
-
+        if (L) TotalDynLen = InsertBuilder.CreateAdd(TotalDynLen, L, "dyn.len.add"); 
+   }
+ 
     CallInst *MergedCall = nullptr;
 
     auto buildArgs = [&](Value *DataBuf) -> SmallVector<Value*, 8> {
@@ -731,7 +731,7 @@ namespace {
       Function *F = Batch.back()->getFunction();
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
       AllocaInst *ContiguousBuf = EntryBuilder.CreateAlloca(VecTy, nullptr, "simd.shadow.buf");
-      ContiguousBuf->setAlignment(Align(4096));
+      ContiguousBuf->setAlignment(Align(64));
       InsertBuilder.CreateStore(GatherVec, ContiguousBuf);
       Value *BufCast = InsertBuilder.CreatePointerCast(ContiguousBuf, InsertBuilder.getPtrTy());
       
@@ -748,7 +748,7 @@ namespace {
       Type *Int8Ty = InsertBuilder.getInt8Ty();
       ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
       AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
-      ShadowBuf->setAlignment(Align(4096)); 
+      ShadowBuf->setAlignment(Align(64)); 
 
       uint64_t CurrentOffset = 0;
       for (size_t i = 0; i < Batch.size(); ++i) {
@@ -780,7 +780,7 @@ namespace {
       AllocaInst *HeapBufPtr = EntryBuilder.CreateAlloca(PtrTy, nullptr, "dyn.shadow.ptr");
       
       Value *MallocSize = InsertBuilder.CreateZExtOrTrunc(TotalDynLen, SizeTy);
-      InsertBuilder.CreateCall(MemAlignFunc, {HeapBufPtr, InsertBuilder.getIntN(SizeTy->getIntegerBitWidth(), 4096), MallocSize});
+      InsertBuilder.CreateCall(MemAlignFunc, {HeapBufPtr, InsertBuilder.getIntN(SizeTy->getIntegerBitWidth(), 64), MallocSize});
       Value *HeapBuf = InsertBuilder.CreateLoad(PtrTy, HeapBufPtr, "dyn.shadow.buf");
       
       Value *CurrentOffset = InsertBuilder.getIntN(SizeTy->getIntegerBitWidth(), 0);
@@ -1027,17 +1027,6 @@ namespace {
       bool Changed = false;
       SmallVector<Instruction*, 16> Lifetimes; 
       
-      for (BasicBlock &BB : F) {
-        for (Instruction &I : BB) {
-          if (auto *CI = dyn_cast<CallInst>(&I)) {
-            if (CI->getIntrinsicID() == Intrinsic::lifetime_end) Lifetimes.push_back(CI);
-          }
-        }
-      }
-      
-      for (Instruction *I : Lifetimes) I->eraseFromParent();
-      if (!Lifetimes.empty()) Changed = true;
-            
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
