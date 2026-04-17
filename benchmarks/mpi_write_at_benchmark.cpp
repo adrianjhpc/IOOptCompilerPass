@@ -40,16 +40,19 @@ int main(int argc, char** argv) {
 
     // Create a 16KB payload buffer
     std::vector<char> buffer(16 * CHUNK_SIZE, 'A' + rank);
+
+    MPI_Offset per_rank_bytes = (MPI_Offset)NUM_ITERATIONS * (16 * CHUNK_SIZE);
+    MPI_Offset rank_base = (MPI_Offset)rank * per_rank_bytes;
     
     // Warmup
-    write_16_chunks(fh, 0, buffer);
+    write_16_chunks(fh, rank_base, buffer);
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // The core workload: 10,000 checkpoints
     for (int i = 0; i < NUM_ITERATIONS; ++i) {
-        MPI_Offset offset = (MPI_Offset)i * (16 * CHUNK_SIZE);
+        MPI_Offset offset = rank_base + (MPI_Offset)i * (16 * CHUNK_SIZE);
         write_16_chunks(fh, offset, buffer);
     }
 
