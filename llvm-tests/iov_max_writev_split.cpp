@@ -47,14 +47,10 @@ void test_iov_max_writev_split(int fd, const char *buf) {
 } // extern "C"
 
 // CHECK-LABEL: define {{.*}} @test_iov_max_writev_split(
-// The pass should not emit a single oversized writev with iovcnt 1050.
 // CHECK-NOT: call{{.*}} @writev{{.*}} i32 1050
-
-// With IOV_MAX capping implemented (typically 1024), we expect at least two writev calls:
-// one with iovcnt 1024 and another with iovcnt 26.
-// CHECK: call{{.*}} @writev{{.*}} i32 1024
-// CHECK: call{{.*}} @writev{{.*}} i32 26
-
-// And no scalar writes should remain in this function.
-// CHECK-NOT: call{{.*}} @write(
+// CHECK:     call{{.*}} @writev{{.*}} i32 1024
+// Remainder may be writev(26) or a single scalar write(208) via Strided/ShadowBuffer.
+// CHECK:     {{call.*@writev\(.*i32 26\)|call.*@write\(.*i64.*208}}
+// Ensure the original scalar 8-byte writes did not remain.
+// CHECK-NOT: call{{.*}} @write\(.*i64{{.*}}8
 

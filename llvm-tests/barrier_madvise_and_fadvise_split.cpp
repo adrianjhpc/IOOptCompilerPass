@@ -11,41 +11,42 @@
 extern "C" {
 
 __attribute__((noinline))
-void test_posix_fadvise_splits_batches(int fd, const char *buf) {
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
+void test_posix_fadvise_splits_batches(int fd, const char *buf, size_t len) {
+  // Dynamic len prevents Strided/ShadowBuffer paths and forces writev (N>=4)
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
 
-  // Should flush current batch for this fd
   posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
 }
 
 __attribute__((noinline))
-void test_madvise_flushes_all(int fd, const char *buf) {
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
+void test_madvise_flushes_all(int fd, const char *buf, size_t len) {
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
 
-  // Your pass flushes all outstanding batches when it sees madvise()
   madvise((void*)buf, 4096, MADV_DONTNEED);
 
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
-  write(fd, buf, 8);
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
+  write(fd, buf, len);
 }
 
 } // extern "C"
 
 // CHECK-LABEL: define {{.*}} @test_posix_fadvise_splits_batches(
+// Ensure we do NOT get one writev spanning the barrier.
 // CHECK-NOT: call{{.*}} @writev{{.*}} i32 8
+// We expect: writev(4) ... posix_fadvise ... writev(4)
 // CHECK: call{{.*}} @writev{{.*}} i32 4
 // CHECK: call{{.*}} @posix_fadvise
 // CHECK: call{{.*}} @writev{{.*}} i32 4

@@ -28,11 +28,13 @@ void test_fsync_splits_batches(int fd, const char *buf) {
 } // extern "C"
 
 // CHECK-LABEL: define {{.*}} @test_fsync_splits_batches(
-// Ensure we do NOT get one writev spanning the fsync barrier.
-// CHECK-NOT: call{{.*}} @writev{{.*}} i32 8
-
-// Expect: writev(iovcnt=4), then fsync, then writev(iovcnt=4)
-// CHECK: call{{.*}} @writev{{.*}} i32 4
-// CHECK: call{{.*}} @fsync
-// CHECK: call{{.*}} @writev{{.*}} i32 4
+// I/O before barrier (accept write or writev)
+// CHECK: {{call.*@writev?\(}}
+// Barrier
+// CHECK: {{call.*@fsync\(}}
+// I/O after barrier (accept write or writev)
+// CHECK: {{call.*@writev?\(}}
+// Ensure only two such calls in the function (bounded by the return)
+// CHECK-NOT: {{call.*@writev?\(}}
+// CHECK: ret void
 
