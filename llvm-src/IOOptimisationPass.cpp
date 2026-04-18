@@ -65,6 +65,7 @@ struct IOConfig {
   unsigned BatchThreshold;
   unsigned ShadowBufferSize;
   unsigned HighWaterMark;
+  unsigned MaxIov;
   bool EnableLogging;
 
   IOConfig() {
@@ -75,6 +76,9 @@ struct IOConfig {
     HighWaterMark = getEnvOrDefault("IO_HIGH_WATER_MARK", 65536);
     if(HighWaterMark <= 0) HighWaterMark = 65536;
     EnableLogging = getEnvOrDefault("IO_ENABLE_LOGGING", 1) != 0;
+    MaxIov = getEnvOrDefault("IO_MAX_IOV", 1024);
+    if (MaxIov <= 0) MaxIov = 1024;
+
   }
 };
 
@@ -659,10 +663,50 @@ namespace {
     
     IOPattern Pattern = classifyBatch(Batch, DL, TotalConstSize, &SE);
 
+    if (Pattern == IOPattern::Vectored && Batch.size() > Config.MaxIov) {
+      // Split into chunks of MaxIov and flush chunk-by-chunk.
+      // (Minimal approach: return false and leave scalar calls, but chunking is better.)
+    }
+    
     if (Pattern == IOPattern::Unprofitable) {
       Batch.clear();
       return false; 
     }
+
+    //
+    // Even if run-level batching accidentally forms an oversized batch, never emit a
+    // single readv/writev/preadv/pwritev with iovcnt > MaxIov (typically 1024 on Linux).
+    //
+    // We conservatively split the batch into chunks and flush them in order.
+    if (Pattern == IOPattern::Vectored) {
+      unsigned Limit = Config.MaxIov;
+      if (Limit == 0) Limit = 1024;
+      if (Batch.size() > Limit) {
+	bool AnyChanged = false;
+	
+	// Process in-order chunks of at most Limit calls.
+	size_t I = 0;
+	while (I < Batch.size()) {
+	  size_t End = I + (size_t)Limit;
+	  if (End > Batch.size()) End = Batch.size();
+	  
+	  SmallVector<CallInst*, 1024> Chunk;
+	  Chunk.append(Batch.begin() + I, Batch.begin() + End);
+	  
+	  // Recursively flush each chunk. Each chunk is <= Limit, so this will terminate.
+	  AnyChanged |= flushBatch(Chunk, M, SE, DT);
+	  
+	  I = End;
+	}
+	
+	// We have consumed the logical batch; clear the original vector so callers
+	// don't try to reuse it.
+	Batch.clear();
+	return AnyChanged;
+      }
+    }
+    
+    
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
     bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD || FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::MPI_READ_AT || FirstArgs.Type == IOArgs::CXX_READ);
@@ -1234,7 +1278,6 @@ namespace {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       NumFunctionsAnalyzed++;
       bool Changed = false;
-      SmallVector<Instruction*, 16> Lifetimes; 
       
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
@@ -1313,19 +1356,27 @@ namespace {
 		    ActiveBatchBytes[BaseFD] = 0;
 		  }
 		}
-		
 		if (isSafeToAddToBatch(Batch, Call, AA, DL, SE, DT, PDT)) {
+
+		  if (Batch.size() >= Config.MaxIov) {
+		    if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
+		    ActiveBatchBytes[BaseFD] = 0;
+		  }
+
 		  Batch.push_back(Call);
 		  ActiveBatchBytes[BaseFD] += CallBytes;
-		  
+
 		  if (ActiveBatchBytes[BaseFD] >= Config.HighWaterMark) {
 		    if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
 		    ActiveBatchBytes[BaseFD] = 0;
 		  }
 		} else {
 		  if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
+		  ActiveBatchBytes[BaseFD] = 0;
+
+		  // If the batch was huge, we already flushed; start fresh with this call
 		  Batch.push_back(Call);
-		  ActiveBatchBytes[BaseFD] = CallBytes; 
+		  ActiveBatchBytes[BaseFD] = CallBytes;
 		}
 	      }
 	    }
@@ -1335,7 +1386,7 @@ namespace {
       
       flushAllBatches();
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
-    } 
+    }
   };
 }
 
