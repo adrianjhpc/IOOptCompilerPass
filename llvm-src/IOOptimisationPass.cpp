@@ -65,9 +65,8 @@ STATISTIC(NumBatchesMerged, "Number of standard I/O batches merged");
 STATISTIC(NumZeroCopy, "Number of zero-copy (splice/sendfile) optimizations");
 STATISTIC(NumIPAInlines, "Number of inter-procedural I/O chains collapsed");
 STATISTIC(NumFunctionsAnalyzed, "Number of functions analyzed by IOOpt");
-STATISTIC(NumBatchesRejectedUnsafeUse,
-          "Number of batches skipped because a used return was needed pre-merge");
-
+STATISTIC(NumBatchesRejectedUnsafeUse, "Number of batches skipped because a used return was needed pre-merge");
+STATISTIC(NumPrefetchHints, "Number of posix_fadvise(WILLNEED) prefetch hints inserted");
 // --- Master enable + gating flags (fix #7: don't transform aggressively just
 // because the plugin is loaded). ---
 static cl::opt<bool>
@@ -90,6 +89,11 @@ static cl::opt<bool> AssumeRegularFiles(
              "datagram/seqpacket sockets may be batched (atomicity/message "
              "boundaries would otherwise change)."));
 
+static cl::opt<bool> EnablePrefetch(
+    "io-opt-prefetch", cl::init(true), cl::Hidden,
+    cl::desc("Insert posix_fadvise(WILLNEED) hints for analyzable, un-merged "
+             "sequential pread loop ranges."));
+
 static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
   const char *Val = std::getenv(Name);
   if (!Val || !*Val) return Default;
@@ -111,6 +115,8 @@ struct IOConfig {
   unsigned ShadowBufferSize;
   unsigned HighWaterMark;
   unsigned MaxIov;
+  unsigned PrefetchMinBytes;
+  unsigned PrefetchMaxBytes;
   bool EnableLogging;
 
   IOConfig() {
@@ -118,6 +124,8 @@ struct IOConfig {
     ShadowBufferSize = getEnvOrDefaultU("IO_SHADOW_BUFFER_MAX", 4096);
     HighWaterMark    = getEnvOrDefaultU("IO_HIGH_WATER_MARK", 65536);
     MaxIov           = getEnvOrDefaultU("IO_MAX_IOV", 1024);
+    PrefetchMinBytes = getEnvOrDefaultU("IO_PREFETCH_MIN_BYTES", 65536);
+    PrefetchMaxBytes = getEnvOrDefaultU("IO_PREFETCH_MAX_BYTES", 128u * 1024 * 1024);
     EnableLogging    = getEnvOrDefaultU("IO_ENABLE_LOGGING", 0) != 0;
   }
 };
@@ -1622,6 +1630,116 @@ namespace {
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
   };
+
+    struct IOPrefetchPass : public PassInfoMixin<IOPrefetchPass> {
+
+    // Compute [start, trips*count) for a forward-contiguous pread addrec in L.
+    static bool analyzeSequentialPread(CallInst *Call, const IOArgs &Args, Loop *L,
+                                       ScalarEvolution &SE, const DataLayout &DL,
+                                       const SCEV *&StartOff, const SCEV *&TotalLen) {
+      Value *Count = Args.Length;
+      if (!Count || !L->isLoopInvariant(Count)) return false;
+
+      Value *OffV = Call->getArgOperand(3);          // pread offset
+      if (!SE.isSCEVable(OffV->getType())) return false;
+
+      auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+      if (!AR || AR->getLoop() != L || !AR->isAffine()) return false;
+      if (!SE.isLoopInvariant(AR->getStart(), L)) return false;
+
+      Type *IdxTy = DL.getIntPtrType(Call->getContext());
+      const SCEV *Step   = SE.getTruncateOrZeroExtend(AR->getStepRecurrence(SE), IdxTy);
+      const SCEV *CountS  = SE.getTruncateOrZeroExtend(SE.getSCEV(Count), IdxTy);
+
+      // Require step == count so the covered range is exactly contiguous.
+      if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, Step, CountS)) return false;
+
+      const SCEV *BEC = SE.getBackedgeTakenCount(L);
+      if (isa<SCEVCouldNotCompute>(BEC)) return false;
+      const SCEV *Trips =
+          SE.getAddExpr(SE.getTruncateOrZeroExtend(BEC, IdxTy), SE.getOne(IdxTy));
+
+      StartOff = SE.getTruncateOrZeroExtend(AR->getStart(), IdxTy);
+      TotalLen = SE.getMulExpr(CountS, Trips);
+      return true;
+    }
+
+    static bool runOnLoop(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
+      if (!L->isLoopSimplifyForm()) return false;
+      BasicBlock *Preheader = L->getLoopPreheader();
+      if (!Preheader) return false;
+
+      // Single, count-controlled exit only: an early break would make us
+      // prefetch more of the file than the loop actually consumes.
+      if (!L->getExitingBlock() || !L->getExitBlock()) return false;
+
+      Module *M = L->getHeader()->getModule();
+      LLVMContext &C = M->getContext();
+      Type *I32 = Type::getInt32Ty(C);
+      Type *I64 = Type::getInt64Ty(C);   // off_t assumed 64-bit (LFS); see caveat
+      FunctionType *FadviseTy = FunctionType::get(I32, {I32, I64, I64, I32}, false);
+      FunctionCallee Fadvise = M->getOrInsertFunction("posix_fadvise", FadviseTy);
+
+      bool Changed = false;
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : *BB) {
+          auto *Call = dyn_cast<CallInst>(&I);
+          if (!Call) continue;
+          if (Call->getMetadata("io.prefetched")) continue;   // idempotency
+
+          IOArgs Args = getIOArguments(Call);
+          if (Args.Type != IOArgs::POSIX_PREAD) continue;
+
+          const SCEV *StartOff = nullptr, *TotalLen = nullptr;
+          if (!analyzeSequentialPread(Call, Args, L, SE, DL, StartOff, TotalLen))
+            continue;
+
+          // v1: require a statically-known, sensibly-bounded length. This also
+          // guarantees len != 0 -- posix_fadvise treats len==0 as "to EOF",
+          // which we must never emit accidentally.
+          auto *LenC = dyn_cast<SCEVConstant>(TotalLen);
+          if (!LenC || LenC->getAPInt().getActiveBits() > 64) continue;
+          uint64_t Bytes = LenC->getAPInt().getZExtValue();
+          if (Bytes < Config.PrefetchMinBytes) continue;   // too small to matter
+          if (Bytes > Config.PrefetchMaxBytes) continue;   // avoid cache pollution
+
+          Instruction *IP = Preheader->getTerminator();
+          SCEVExpander Exp(SE, DL, "io.prefetch");
+          Value *OffVal = Exp.expandCodeFor(StartOff, I64, IP);
+
+          IRBuilder<> B(IP);
+          Value *Fd = B.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
+          // POSIX_FADV_WILLNEED == 3 on mainstream Linux/glibc (see caveat).
+          B.CreateCall(Fadvise, {Fd, OffVal, B.getInt64(Bytes), B.getInt32(3)});
+
+          Call->setMetadata("io.prefetched", MDNode::get(C, {}));
+          NumPrefetchHints++;
+          Changed = true;
+          logMessage("[IOOpt] Prefetch: posix_fadvise(WILLNEED) inserted for a "
+                     "sequential pread loop range (" + Twine(Bytes) + " bytes).");
+        }
+      }
+      return Changed;
+    }
+
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+      if (!EnableIOOpt || !EnablePrefetch) return PreservedAnalyses::all();
+      // Advisory, but only worth a syscall on seekable/regular files.
+      if (!AssumeRegularFiles) return PreservedAnalyses::all();
+
+      const DataLayout &DL = F.getParent()->getDataLayout();
+      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+      ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+
+      bool Changed = false;
+      for (Loop *L : LI.getLoopsInPreorder())
+        if (runOnLoop(L, SE, DL)) Changed = true;
+
+      return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+  };
+
+
 }
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
@@ -1636,6 +1754,7 @@ llvmGetPassPluginInfo() {
         FPM.addPass(LCSSAPass());
         FPM.addPass(IOLoopHoistingPass());   // separate pass -> analyses recomputed
         FPM.addPass(IOBatchingPass());
+        FPM.addPass(IOPrefetchPass());   // targets un-merged pread loops
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       };
 
@@ -1645,6 +1764,7 @@ llvmGetPassPluginInfo() {
           if (Name == "io-opt") {
             FPM.addPass(IOLoopHoistingPass());
             FPM.addPass(IOBatchingPass());
+            FPM.addPass(IOPrefetchPass());
             return true;
           }
           return false;
