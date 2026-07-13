@@ -1,6 +1,5 @@
 // RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s --check-prefix=PREFETCH
-// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -io-opt-prefetch=false -S | %FileCheck %s --check-prefix=NOPREFETCH
-
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -io-opt-prefetch=false -io-opt-prefetch-sequential=false -S | %FileCheck %s --check-prefix=NOPREFETCH
 #include <unistd.h>
 
 extern "C" {

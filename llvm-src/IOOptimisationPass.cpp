@@ -67,7 +67,14 @@ STATISTIC(NumIPAInlines, "Number of inter-procedural I/O chains collapsed");
 STATISTIC(NumFunctionsAnalyzed, "Number of functions analyzed by IOOpt");
 STATISTIC(NumBatchesRejectedUnsafeUse, "Number of batches skipped because a used return was needed pre-merge");
 STATISTIC(NumPrefetchHints, "Number of posix_fadvise(WILLNEED) prefetch hints inserted");
-// --- Master enable + gating flags (fix #7: don't transform aggressively just
+STATISTIC(NumSeqHints, "Number of posix_fadvise(SEQUENTIAL) hints inserted");
+
+static cl::opt<bool> EnableSeqPrefetch(
+    "io-opt-prefetch-sequential", cl::init(true), cl::Hidden,
+    cl::desc("Insert posix_fadvise(SEQUENTIAL) for loops with monotonic "
+             "sequential reads (covers read()/fread that WILLNEED cannot)."));
+
+// --- Master enable + gating flags (Don't transform aggressively just
 // because the plugin is loaded). ---
 static cl::opt<bool>
     EnableIOOpt("enable-io-opt", cl::init(true), cl::Hidden,
@@ -1631,7 +1638,7 @@ namespace {
     }
   };
 
-    struct IOPrefetchPass : public PassInfoMixin<IOPrefetchPass> {
+  struct IOPrefetchPass : public PassInfoMixin<IOPrefetchPass> {
 
     // Compute [start, trips*count) for a forward-contiguous pread addrec in L.
     static bool analyzeSequentialPread(CallInst *Call, const IOArgs &Args, Loop *L,
@@ -1677,8 +1684,6 @@ namespace {
       LLVMContext &C = M->getContext();
       Type *I32 = Type::getInt32Ty(C);
       Type *I64 = Type::getInt64Ty(C);   // off_t assumed 64-bit (LFS); see caveat
-      FunctionType *FadviseTy = FunctionType::get(I32, {I32, I64, I64, I32}, false);
-      FunctionCallee Fadvise = M->getOrInsertFunction("posix_fadvise", FadviseTy);
 
       bool Changed = false;
       for (BasicBlock *BB : L->blocks()) {
@@ -1708,6 +1713,8 @@ namespace {
           Value *OffVal = Exp.expandCodeFor(StartOff, I64, IP);
 
           IRBuilder<> B(IP);
+          FunctionCallee Fadvise = M->getOrInsertFunction(
+              "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
           Value *Fd = B.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
           // POSIX_FADV_WILLNEED == 3 on mainstream Linux/glibc (see caveat).
           B.CreateCall(Fadvise, {Fd, OffVal, B.getInt64(Bytes), B.getInt32(3)});
@@ -1721,7 +1728,7 @@ namespace {
       }
       return Changed;
     }
-
+ 
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       if (!EnableIOOpt || !EnablePrefetch) return PreservedAnalyses::all();
       // Advisory, but only worth a syscall on seekable/regular files.
@@ -1738,7 +1745,155 @@ namespace {
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
   };
+ 
 
+  struct IOSequentialPrefetchPass : public PassInfoMixin<IOSequentialPrefetchPass> {
+
+    // fd identity: see through a load-from-slot so a stored/reloaded fd compares
+    // equal (mirrors IOBatchingPass::fdKey).
+    static Value *fdKey(Value *V) {
+      if (!V) return nullptr;
+      if (auto *LI = dyn_cast<LoadInst>(V)) {
+        Value *P = LI->getPointerOperand();
+        if (P->getType()->isPointerTy())
+          return const_cast<Value *>(getUnderlyingObject(P));
+      }
+      return V;
+    }
+
+    static bool loopHasSeek(Loop *L) {
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *F = CI->getCalledFunction())
+              if (F->hasName()) {
+                StringRef N = F->getName();
+                if (isSymbolName(N, "lseek") || isSymbolName(N, "lseek64") ||
+                    isSymbolName(N, "llseek") || isSymbolName(N, "fseek") ||
+                    isSymbolName(N, "fseeko") || isSymbolName(N, "rewind"))
+                  return true;
+              }
+      return false;
+    }
+
+    // pread carries its own offset -> prove sequential via a non-negative-step
+    // affine addrec in L (independent of any seeks).
+    static bool preadOffsetIsSequential(CallInst *Call, Loop *L, ScalarEvolution &SE) {
+      Value *OffV = Call->getArgOperand(3);
+      if (!SE.isSCEVable(OffV->getType())) return false;
+      auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+      if (!AR || AR->getLoop() != L || !AR->isAffine()) return false;
+      return SE.isKnownNonNegative(AR->getStepRecurrence(SE));
+    }
+
+    // SEQUENTIAL needs an *integer* fd. POSIX reads already have one; fread's
+    // target is a FILE* (bridge via fileno); C++ streams expose no portable fd.
+    static Value *resolveFd(IRBuilder<> &B, const IOArgs &Args, Module *M) {
+      Type *I32 = B.getInt32Ty();
+      if (Args.Target->getType()->isIntegerTy())
+        return B.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
+      if (Args.Type == IOArgs::C_FREAD) {
+        Type *PtrTy = B.getPtrTy();
+        FunctionCallee Fileno =
+            M->getOrInsertFunction("fileno", FunctionType::get(I32, {PtrTy}, false));
+        Value *Fp = Args.Target;
+        if (Fp->getType() != PtrTy && Fp->getType()->isPointerTy())
+          Fp = B.CreatePointerBitCastOrAddrSpaceCast(Fp, PtrTy);
+        return B.CreateCall(Fileno, {Fp});
+      }
+      return nullptr; // CXX_READ or unknown pointer target: no portable fd.
+    }
+
+    static void markReadsOnFd(Loop *L, Value *FdK, LLVMContext &C) {
+      MDNode *Tag = MDNode::get(C, {});
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (auto *CI = dyn_cast<CallInst>(&I))
+            if (fdKey(getIOArguments(CI).Target) == FdK)
+              CI->setMetadata("io.seq.hinted", Tag);
+    }
+
+    static bool runOnLoop(Loop *L, ScalarEvolution &SE) {
+      if (!L->isLoopSimplifyForm()) return false;
+      BasicBlock *Preheader = L->getLoopPreheader();
+      if (!Preheader) return false;
+
+      // Skip trivially short loops (SEQUENTIAL is cheap, but not worth it for 1-2 iters).
+      const SCEV *BEC = SE.getBackedgeTakenCount(L);
+      if (auto *C = dyn_cast<SCEVConstant>(BEC))
+        if (C->getAPInt().getZExtValue() + 1 < 4) return false;
+
+      const bool SeekPresent = loopHasSeek(L);
+      Module *M = L->getHeader()->getModule();
+      LLVMContext &C = M->getContext();
+      Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+
+      SmallPtrSet<Value *, 8> HintedFDs;
+      bool Changed = false;
+
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : *BB) {
+          auto *Call = dyn_cast<CallInst>(&I);
+          if (!Call || Call->getMetadata("io.seq.hinted")) continue;
+
+          IOArgs Args = getIOArguments(Call);
+          bool ImplicitRead = (Args.Type == IOArgs::POSIX_READ ||
+                               Args.Type == IOArgs::C_FREAD);
+          bool ExplicitRead = (Args.Type == IOArgs::POSIX_PREAD);
+          // CXX_READ deliberately excluded: no portable fd.
+          if (!ImplicitRead && !ExplicitRead) continue;
+
+          // Don't double up with the WILLNEED pass on the same pread.
+          if (ExplicitRead && Call->getMetadata("io.prefetched")) continue;
+
+          if (!Args.Target || !L->isLoopInvariant(Args.Target)) continue;
+
+          // Sequentiality:
+          //  - implicit-offset reads advance the file position themselves, so a
+          //    loop of them is sequential unless a seek perturbs the offset.
+          //  - pread carries its offset -> require a monotonic addrec; seeks OK.
+          if (ExplicitRead) {
+            if (!preadOffsetIsSequential(Call, L, SE)) continue;
+          } else if (SeekPresent) {
+            continue;
+          }
+
+          Value *FdK = fdKey(Args.Target);
+          if (!FdK || !HintedFDs.insert(FdK).second) continue; // dedup within run
+
+          Instruction *IP = Preheader->getTerminator();
+          IRBuilder<> B(IP);
+          Value *Fd = resolveFd(B, Args, M);
+          if (!Fd) { HintedFDs.erase(FdK); continue; }
+
+          FunctionCallee Fadvise = M->getOrInsertFunction(
+              "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
+          // offset=0,len=0 => whole file; SEQUENTIAL == 2 on mainstream Linux.
+          B.CreateCall(Fadvise, {Fd, B.getInt64(0), B.getInt64(0), B.getInt32(2)});
+          markReadsOnFd(L, FdK, C); // idempotent across re-runs
+          NumSeqHints++;
+          Changed = true;
+          logMessage("[IOOpt] Prefetch: posix_fadvise(SEQUENTIAL) inserted for a "
+                     "sequential read loop.");
+        }
+      }
+      return Changed;
+    }
+
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+      if (!EnableIOOpt || !EnableSeqPrefetch) return PreservedAnalyses::all();
+      if (!AssumeRegularFiles) return PreservedAnalyses::all();
+
+      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+      ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+
+      bool Changed = false;
+      for (Loop *L : LI.getLoopsInPreorder())
+        if (runOnLoop(L, SE)) Changed = true;
+
+      return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+  };
 
 }
 
@@ -1755,6 +1910,7 @@ llvmGetPassPluginInfo() {
         FPM.addPass(IOLoopHoistingPass());   // separate pass -> analyses recomputed
         FPM.addPass(IOBatchingPass());
         FPM.addPass(IOPrefetchPass());   // targets un-merged pread loops
+        FPM.addPass(IOSequentialPrefetchPass()); // general offset free prefetch
         MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
       };
 
@@ -1765,6 +1921,7 @@ llvmGetPassPluginInfo() {
             FPM.addPass(IOLoopHoistingPass());
             FPM.addPass(IOBatchingPass());
             FPM.addPass(IOPrefetchPass());
+            FPM.addPass(IOSequentialPrefetchPass());
             return true;
           }
           return false;
@@ -1784,7 +1941,7 @@ llvmGetPassPluginInfo() {
           return false;
         });
 
-      // Early IPO wrapper inlining is opt-in for *implicit* injection (fix #7).
+      // Early IPO wrapper inlining is opt-in for *implicit* injection 
       PB.registerPipelineStartEPCallback(
         [](ModulePassManager &MPM, OptimizationLevel Level) {
           if (EnableEarlyIPO)
