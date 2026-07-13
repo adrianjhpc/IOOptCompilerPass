@@ -5,11 +5,25 @@
 
 extern "C" {
 
+// Four scattered buffers would normally be a pwritev candidate, but each
+// pwrite's return value is checked with `if (rN < 0) return;` before the next
+// pwrite runs. Because those results are consumed before the merge point, the
+// return-availability gate refuses the batch: merging could perform later
+// writes the original program would have skipped after an error. The calls are
+// left intact and no iovec array is emitted.
+
 // CHECK-LABEL: define {{.*}}optimised_pwrite
 void optimised_pwrite(int fd, const char* b1, const char* b2, const char* b3, const char* b4, size_t len, off_t offset) {
-    // By using 4 different pointers (b1, b2, b3, b4), we force 
-    // the classifier to use 'pwritev' because the memory is scattered.
-    
+    // No batching: all four original pwrite calls must survive.
+    // CHECK: call i64 @pwrite(
+    // CHECK: call i64 @pwrite(
+    // CHECK: call i64 @pwrite(
+    // CHECK: call i64 @pwrite(
+
+    // The pwritev conversion and its iovec array must NOT be generated.
+    // CHECK-NOT: iovec.array.N
+    // CHECK-NOT: call i64 @pwritev
+
     ssize_t r1 = pwrite(fd, b1, len, offset);
     if (r1 < 0) return;
 
@@ -21,10 +35,7 @@ void optimised_pwrite(int fd, const char* b1, const char* b2, const char* b3, co
 
     ssize_t r4 = pwrite(fd, b4, len, offset + (len * 3));
     if (r4 < 0) return;
-
-    // NOW the check will find the iovec array
-    // CHECK: %iovec.array.N = alloca [4 x { ptr, i64 }], align 8
-    // CHECK: call i64 @pwritev
 }
 
 }
+
