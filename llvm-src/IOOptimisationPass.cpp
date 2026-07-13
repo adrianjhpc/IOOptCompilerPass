@@ -450,17 +450,6 @@ namespace {
     return false;
   }
 
-  bool dependsOn(Value *V, Value *Target, int Depth = 0) {
-    if (V == Target) return true;
-    if (Depth > 4) return false;
-    if (auto *Inst = dyn_cast<Instruction>(V)) {
-      for (Value *Op : Inst->operands()) {
-        if (dependsOn(Op, Target, Depth + 1)) return true;
-      }
-    }
-    return false;
-  }
-
   bool isDeeplySafeFromIO(Function *F, SmallPtrSetImpl<Function*> &Visited) {
     if (!F || F->isDeclaration()) return false;
     if (!Visited.insert(F).second) return true;
@@ -603,18 +592,21 @@ namespace {
     BasicBlock *BB1 = LastCall->getParent();
     BasicBlock *BB2 = NewCall->getParent();
 
-    if (BB1 != BB2) {
-      if (!PDT.dominates(BB2, BB1)) {
-        if (isReadBatch) return false;
+    // Require the new call's block to post-dominate the last call's block.
+    //
+    // We previously also admitted *write* batches across a conditional branch
+    // whose condition depended on the last call (the "partial-write spoof").
+    // That path was dead: for the branch to depend on the last call, the call's
+    // return value must be used *before* the merge point (Batch.back()), so the
+    // return-availability gate in prepareBatch() -- insertDominatesAllUses() --
+    // unconditionally discarded every such batch. Worse, merging there would be
+    // semantically wrong: a short/failed early call could no longer suppress the
+    // later I/O, because the bytes were already pushed to the fd in one call.
+    // Requiring post-dominance makes the accepted set match what we can safely
+    // emit.
+    if (BB1 != BB2 && !PDT.dominates(BB2, BB1))
+      return false;
 
-        auto *Term = BB1->getTerminator();
-        if (auto *Br = dyn_cast<BranchInst>(Term)) {
-          if (!Br->isConditional() || !dependsOn(Br->getCondition(), LastCall)) return false;
-        } else {
-          return false;
-        }
-      }
-    }
 
     LoadInst *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
 
@@ -1458,11 +1450,20 @@ namespace {
       return LoopChanged;
     }
 
+
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       if (!EnableIOOpt) return PreservedAnalyses::all();
 
+      // Collapsing a loop of reads/writes into one large call changes PIPE_BUF atomicity on
+      // pipes/FIFOs and message boundaries on datagram/seqpacket sockets. We can't
+      // prove "regular file" from IR, so honour the same lever batching uses.
+      // (Applies to both reads and writes: a merged datagram read also changes
+      // per-message boundary semantics.)
+      if (!AssumeRegularFiles) return PreservedAnalyses::all();
+
       const DataLayout &DL = F.getParent()->getDataLayout();
       bool Changed = false;
+
 
       // After any mutating hoist, invalidate + refetch analyses so we
       // never make a subsequent decision based on stale SE/DT/MSSA/LI/AA.
