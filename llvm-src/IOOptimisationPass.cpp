@@ -2339,7 +2339,7 @@ namespace {
       Value *RcN = OB.CreateIntCast(Rc, R->getType(), true);
       Value *RcW = OB.CreateIntCast(Rc, W->getType(), true);
       Term->eraseFromParent();
-      BranchInst::Create(ContBB, ContBB, Need, OrigBB);
+      BranchInst::Create(FbBB, ContBB, Need, OrigBB);
 
       // Fallback: exact original calls (regular libc semantics preserved).
       IRBuilder<> FB(FbBB);
