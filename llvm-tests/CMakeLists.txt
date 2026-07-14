@@ -9,7 +9,7 @@ find_program(OPT_EXE opt HINTS ${LLVM_TOOLS_BINARY_DIR})
 if(LLVM_LINK_EXE AND OPT_EXE)
     add_test(
         NAME HourglassLTOTest
-        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_fullstack_test.sh 
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../llvm-integration-tests/run_fullstack_test.sh 
                 ${CMAKE_C_COMPILER}        
                 ${LLVM_LINK_EXE}      
                 ${OPT_EXE}         

@@ -1,6 +1,6 @@
 // RUN: %ppclang -O2 -fno-inline -fno-unroll-loops -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s
 //
-// Tier-1 explicit-offset loop collapse (IOLoopHoistingPass).
+// Explicit-offset loop collapse (IOLoopHoistingPass).
 //
 // A loop that issues one pread/pwrite per iteration at a contiguous, unit-stride
 // file offset (offset_i = start + i*count) over a contiguous, unit-stride buffer
@@ -10,7 +10,7 @@
 //
 // -fno-unroll-loops keeps the loop as a loop so IOLoopHoistingPass (not the
 // straight-line IOBatchingPass) is what we exercise. Positive cases use a
-// COMPILE-TIME trip count because Tier-1 requires a constant backedge count.
+// COMPILE-TIME trip count because we require a constant backedge count.
 //
 // Detection metric: the per-iteration length (4096) is replaced by N*4096.
 // For N = 100 the collapsed length is 409600. Note the merged call is built by
@@ -64,7 +64,7 @@ NOINLINE void test_noncontiguous_offset(int fd, char *base, off_t off0) {
 }
 
 // ---------------------------------------------------------------------------
-// NEGATIVE 2: the pwrite return value is USED (running total). Tier-1 cannot
+// NEGATIVE 2: the pwrite return value is USED (running total). Cannot
 // reconstruct per-iteration returns, so the use_empty() gate must refuse.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: define {{.*}}test_used_return
@@ -92,7 +92,7 @@ NOINLINE void test_interleaved_io(int fd, int fd2, char *base, off_t off0) {
 }
 
 // ---------------------------------------------------------------------------
-// NEGATIVE 4: runtime trip count. Tier-1 requires a constant backedge count
+// NEGATIVE 4: runtime trip count. Requires a constant backedge count
 // (for the precise-range AA proof), so a symbolic 'n' must refuse.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: define {{.*}}test_runtime_tripcount

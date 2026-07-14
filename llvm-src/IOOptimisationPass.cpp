@@ -72,6 +72,7 @@ STATISTIC(NumPrefetchHints, "Number of posix_fadvise(WILLNEED) prefetch hints in
 STATISTIC(NumSeqHints, "Number of posix_fadvise(SEQUENTIAL) hints inserted");
 STATISTIC(NumRandomHints, "Number of posix_fadvise(RANDOM) hints inserted");
 STATISTIC(NumCopyFileRange, "Number of read+write bounce buffers promoted to copy_file_range");
+STATISTIC(NumLoopsVectorCollapsed, "Number of scatter I/O loops collapsed to writev/pwritev");
 
 // --- Master enable + gating flags (Don't transform aggressively just
 // because the plugin is loaded). ---
@@ -145,6 +146,12 @@ static cl::opt<bool> CFRAssumeFullReads(
     "io-opt-cfr-assume-full-reads", cl::init(false), cl::Hidden,
     cl::desc("(Requires -io-opt-copy-file-range) Also match copies whose write "
              "length is a constant equal to the read count."));
+
+
+static cl::opt<bool> EnableLoopVectored(
+    "io-opt-loop-vectored", cl::init(false), cl::Hidden,
+    cl::desc("Collapse a loop of scattered write/pwrite into one "
+             "writev/pwritev (opt-in)."));
 
 static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
   const char *Val = std::getenv(Name);
@@ -1500,6 +1507,21 @@ namespace {
       Value *BasePtr = U->getValue();
       if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
 
+      // --- Explicit-offset contiguity proof ---------------------------
+      if (Args.Type == IOArgs::POSIX_PREAD || Args.Type == IOArgs::POSIX_PWRITE) {
+        Value *OffV = Call->getArgOperand(3);
+        if (!SE.isSCEVable(OffV->getType())) return false;
+ 
+        Type *IdxTy = DL.getIntPtrType(Call->getContext());
+        auto *OffAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+        if (!OffAR || OffAR->getLoop() != L || !OffAR->isAffine()) return false;
+        if (!SE.isLoopInvariant(OffAR->getStart(), L)) return false;
+
+        const SCEV *OffStep = SE.getTruncateOrZeroExtend(OffAR->getStepRecurrence(SE), IdxTy);
+        const SCEV *ElemS   = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), IdxTy);
+        if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, OffStep, ElemS)) return false;
+      }
+
       MemoryLocation FullRange(BasePtr, LocationSize::precise(TotalLen));
 
       for (BasicBlock *BB : L->blocks()) {
@@ -1537,6 +1559,188 @@ namespace {
       return true;
     }
 
+    // Collapse a loop of scattered, non-overlapping
+// write/pwrite into ONE writev/pwritev, moving only pointers (no data copy).
+// Returns true (and mutates the loop) on success; caller must then refetch
+// analyses. Writes only; unused return only.
+static bool tryVectoredLoopCollapse(CallInst *Call, const IOArgs &Args, Loop *L,
+                                    ScalarEvolution &SE, const DataLayout &DL,
+                                    AAResults &AA, DominatorTree &DT,
+                                    MemorySSA &MSSA) {
+  Module *M = Call->getModule();
+  LLVMContext &C = M->getContext();
+  Function *F = Call->getFunction();
+
+  // --- Structural preconditions (LoopSimplify guarantees single pre/latch). ---
+  BasicBlock *Pre   = L->getLoopPreheader();
+  BasicBlock *Head  = L->getHeader();
+  BasicBlock *Latch = L->getLoopLatch();
+  BasicBlock *Exit  = L->getExitBlock();
+  if (!Pre || !Head || !Latch || !Exit) return false;
+  if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT)) return false;
+
+  const bool Explicit = (Args.Type == IOArgs::POSIX_PWRITE);
+  Type *IntPtrTy = DL.getIntPtrType(C);
+
+  // --- Constant trip count N in [2, MaxIov]. ---
+  auto *BEC = dyn_cast<SCEVConstant>(SE.getBackedgeTakenCount(L));
+  if (!BEC) return false;
+  const APInt &BECi = BEC->getAPInt();
+  if (BECi.getActiveBits() > 62) return false;
+  uint64_t N = BECi.getZExtValue() + 1;
+  if (N < 2 || N > Config.MaxIov) return false;
+
+  // --- Constant per-call byte count. ---
+  auto *LenC = dyn_cast_or_null<ConstantInt>(Args.Length);
+  if (!LenC) return false;
+  uint64_t Count = LenC->getZExtValue();
+  if (Count == 0) return false;
+
+  // --- Buffer addrec: affine, constant stride, non-overlapping & forward. ---
+  //   stride == count is (scalar) already handled and fires before this; here we
+  //   require stride >= count. stride <= 0 rejects scratch reuse (==0) and
+  //   backwards (<0), both fatal to deferral.
+  auto *BufAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(Args.Buffer));
+  if (!BufAR || BufAR->getLoop() != L || !BufAR->isAffine()) return false;
+  if (!SE.isLoopInvariant(BufAR->getStart(), L)) return false;
+  auto *StepC = dyn_cast<SCEVConstant>(BufAR->getStepRecurrence(SE));
+  if (!StepC) return false;
+  const APInt &StepA = StepC->getAPInt();
+  if (StepA.isNonPositive() || StepA.getActiveBits() > 62) return false;
+  uint64_t Stride = StepA.getZExtValue();
+  if (Stride < Count) return false;                    // overlap -> unsafe
+
+  // --- Concrete base pointer for the AA range. ---
+  auto *BaseU = dyn_cast<SCEVUnknown>(BufAR->getStart());
+  if (!BaseU) return false;
+  Value *BasePtr = BaseU->getValue();
+  if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
+
+  // Span actually read by the vectored call: last slot ends at (N-1)*stride+count.
+  if ((N - 1) > (std::numeric_limits<uint64_t>::max() - Count) / Stride)
+    return false;                                      // overflow guard
+  uint64_t Span = (N - 1) * Stride + Count;
+
+  // --- pwrite: file offset must be contiguous (step == count). write: nothing. ---
+  const SCEVAddRecExpr *OffAR = nullptr;
+  if (Explicit) {
+    Value *OffV = Call->getArgOperand(3);
+    if (!SE.isSCEVable(OffV->getType())) return false;
+    OffAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+    if (!OffAR || OffAR->getLoop() != L || !OffAR->isAffine()) return false;
+    if (!SE.isLoopInvariant(OffAR->getStart(), L)) return false;
+    const SCEV *OffStep =
+        SE.getTruncateOrZeroExtend(OffAR->getStepRecurrence(SE), IntPtrTy);
+    const SCEV *CountS =
+        SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), IntPtrTy);
+    if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, OffStep, CountS)) return false;
+  }
+
+  // --- fd/stream loop-invariant. ---
+  if (!L->isLoopInvariant(Args.Target)) return false;
+
+  // --- No-clobber proof: every store touching the span must be an own-slot,
+  //     per-iteration store (matching stride, start-offset in [0,count)), so
+  //     non-overlap guarantees buf_i is stable from iteration i to loop exit.
+  MemoryLocation FullRange(BasePtr, LocationSize::precise(Span));
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      if (&I == Call) continue;
+      if (!I.mayWriteToMemory()) continue;
+      MemoryAccess *MA = MSSA.getMemoryAccess(&I);
+      if (!MA) return false;
+      if (!isa<MemoryDef>(MA)) continue;
+      if (!isModSet(AA.getModRefInfo(&I, FullRange))) continue;
+      if (!DT.dominates(&I, Call)) return false;
+      Value *WPtr = getMemoryWritePtr(I);
+      if (!WPtr) return false;
+      auto *WAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(WPtr));
+      if (!WAR || WAR->getLoop() != L || !WAR->isAffine()) return false;
+      auto *WStepC = dyn_cast<SCEVConstant>(WAR->getStepRecurrence(SE));
+      if (!WStepC || WStepC->getAPInt() != StepA) return false;
+      auto *Diff = dyn_cast<SCEVConstant>(
+          SE.getMinusSCEV(WAR->getStart(), BufAR->getStart()));
+      if (!Diff) return false;
+      const APInt &DA = Diff->getAPInt();
+      if (DA.isNegative() || DA.getActiveBits() > 62 ||
+          DA.getZExtValue() >= Count)
+        return false;                                  // outside its own slot
+    }
+  }
+
+  // --- No interleaved I/O or opaque side-effecting calls (deferral must not
+  //     cross other observable effects). ---
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      if (&I == Call) continue;
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (getIOArguments(CI).Type != IOArgs::NONE) return false;
+        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+      }
+    }
+  }
+
+  // ----------------------------- Codegen -----------------------------
+  Type *SizeTy = IntPtrTy;
+  Type *I32 = Type::getInt32Ty(C);
+  PointerType *PtrTy = PointerType::getUnqual(C);
+  StructType *IovecTy = StructType::get(C, {PtrTy, SizeTy}); // {iov_base, iov_len}
+  ArrayType *IovArrTy = ArrayType::get(IovecTy, N);
+
+  SCEVExpander Expander(SE, DL, "io.dvlc.expander");
+
+  // iovec array in the entry block.
+  IRBuilder<> EB(&F->getEntryBlock(), F->getEntryBlock().begin());
+  AllocaInst *Iov = EB.CreateAlloca(IovArrTy, nullptr, "iov.dvlc");
+  Iov->setAlignment(Align(16));
+  Value *Iov0 = EB.CreateInBoundsGEP(IovArrTy, Iov,
+                    {EB.getInt32(0), EB.getInt32(0)}, "iov.first");
+
+  // Parallel pointer-IV phi in the header (preds: Pre, Latch in simplify form).
+  IRBuilder<> HB(Head, Head->begin());
+  PHINode *IovCur = HB.CreatePHI(PtrTy, 2, "iov.cur");
+
+  // Fill this iovec slot at the (soon-erased) call site.
+  IRBuilder<> CB(Call);
+  Value *Buf = Args.Buffer;
+  if (Buf->getType() != PtrTy && Buf->getType()->isPointerTy())
+    Buf = CB.CreatePointerBitCastOrAddrSpaceCast(Buf, PtrTy);
+  CB.CreateStore(Buf, CB.CreateStructGEP(IovecTy, IovCur, 0));
+  CB.CreateStore(ConstantInt::get(SizeTy, Count),
+                 CB.CreateStructGEP(IovecTy, IovCur, 1));
+
+  // Advance the pointer-IV in the latch and complete the phi.
+  IRBuilder<> LB(Latch->getTerminator());
+  Value *IovNext = LB.CreateInBoundsGEP(IovecTy, IovCur, LB.getInt64(1), "iov.next");
+  IovCur->addIncoming(Iov0, Pre);
+  IovCur->addIncoming(IovNext, Latch);
+
+  // Single vectored call in the loop EXIT block (deferred write).
+  IRBuilder<> XB(&*Exit->getFirstInsertionPt());
+  Value *Fd  = XB.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
+  Value *Cnt = ConstantInt::get(I32, (uint64_t)N);
+  if (Explicit) {
+    Type *OffArgTy = Call->getArgOperand(3)->getType();
+    Value *BaseOff =
+        Expander.expandCodeFor(OffAR->getStart(), OffArgTy, Pre->getTerminator());
+    FunctionCallee PWV = M->getOrInsertFunction(
+        "pwritev", FunctionType::get(SizeTy, {I32, PtrTy, I32, OffArgTy}, false));
+    XB.CreateCall(PWV, {Fd, Iov0, Cnt, BaseOff});
+  } else {
+    FunctionCallee WV = M->getOrInsertFunction(
+        "writev", FunctionType::get(SizeTy, {I32, PtrTy, I32}, false));
+    XB.CreateCall(WV, {Fd, Iov0, Cnt});
+  }
+
+  Call->eraseFromParent();                  // unused return -> no RAUW
+  NumLoopsVectorCollapsed++;
+  logMessage("[IOOpt] SUCCESS: DVLC collapsed " + Twine(N) +
+             (Explicit ? " pwrite" : " write") + " calls into one " +
+             (Explicit ? "pwritev" : "writev") + ".");
+  return true;
+}
+
+
     static bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL,
                                LoopInfo &LI, DominatorTree &DT, AAResults &AA, MemorySSA &MSSA) {
       BasicBlock *Preheader = L->getLoopPreheader();
@@ -1563,11 +1767,23 @@ namespace {
             Function *CalleeF = Call->getCalledFunction();
             IOArgs Args = getIOArguments(Call, CalleeF);
 
-            bool isWrite = (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::CXX_WRITE);
-            bool isRead = (Args.Type == IOArgs::POSIX_READ || Args.Type == IOArgs::C_FREAD || Args.Type == IOArgs::CXX_READ);
+            bool isExplicit = (Args.Type == IOArgs::POSIX_PREAD || Args.Type == IOArgs::POSIX_PWRITE);
+            bool isWrite = (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::C_FWRITE ||
+                            Args.Type == IOArgs::CXX_WRITE  || Args.Type == IOArgs::POSIX_PWRITE);
+            bool isRead  = (Args.Type == IOArgs::POSIX_READ  || Args.Type == IOArgs::C_FREAD  ||
+                            Args.Type == IOArgs::CXX_READ    || Args.Type == IOArgs::POSIX_PREAD);
 
             if (isWrite || isRead) {
-              if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) continue;
+              if (!Call->use_empty()) continue;
+if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
+  // Fallback: scattered (stride > count) writes -> writev/pwritev.
+  if (EnableLoopVectored && isWrite &&
+      (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_PWRITE) &&
+      tryVectoredLoopCollapse(Call, Args, L, SE, DL, AA, DT, MSSA))
+    return true;      // loop structure mutated; run() invalidates & refetches
+  continue;
+}
+
 
               bool hasSideEffects = false;
               for (BasicBlock *ScanBB : L->blocks()) {
@@ -1639,6 +1855,12 @@ namespace {
               SmallVector<Value *, 8> NewArgs;
               if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
                 NewArgs = {BasePointer, ExtraArg, TotalLenVal, Args.Target};
+              } else if (isExplicit) {
+                Value *OffV = Call->getArgOperand(3);
+                auto *OffAR = cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+                Value *OffStart =
+                      Expander.expandCodeFor(OffAR->getStart(), OffV->getType(), InsertionPoint);
+                NewArgs = {Args.Target, BasePointer, TotalLenVal, OffStart};   // (fd, buf, len, off)
               } else {
                 NewArgs = {Args.Target, BasePointer, TotalLenVal};
               }
