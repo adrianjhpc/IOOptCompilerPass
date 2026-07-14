@@ -130,8 +130,7 @@ rejected outright rather than mis-optimised (`NumBatchesRejectedUnsafeUse`).
 ### ⚠️ Atomicity / message-boundary caveat
 Merging N writes into one `writev`, or collapsing a loop into one transfer, changes
 `PIPE_BUF` atomicity on pipes/FIFOs and message boundaries on datagram/seqpacket
-sockets. IOOpt cannot prove "regular file" from IR, so this is governed by a single
-honest switch: **`-io-opt-assume-regular-files` (default: on)**. Disable it if your
+sockets. IOOpt cannot prove "regular file" from IR, so this is governed by a single switch: **`-io-opt-assume-regular-files` (default: on)**. Disable it if your
 batched fds may be pipes, FIFOs, or datagram/seqpacket sockets — this also disables
 batching, loop hoisting, and prefetch, all of which share the assumption.
 
