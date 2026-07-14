@@ -1,85 +1,219 @@
-# IOOpt: Transparent I/O Coalescing via LLVM LTO
+# IOOpt: Transparent I/O Coalescing, Hoisting & Prefetching for LLVM
 
-[![LLVM: 20.0](https://img.shields.io/badge/LLVM-20.0-blue.svg)](https://llvm.org/)
+[![LLVM: 20.0](https://img.shields.io/badge/LLVM-20.0%2B-blue.svg)](https://llvm.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Tests: 23/23](https://img.shields.io/badge/Tests-23%20Passed-brightgreen.svg)]()
 
-**IOOpt** is a custom LLVM compiler pass that acts as a transparent systems-level OS adapter. It bridges the semantic gap between fragmented user-space applications (like relational databases) and the Linux Virtual File System (VFS) by automatically translating scalar POSIX I/O into hardware-optimized scatter-gather arrays (`readv`, `writev`, `preadv`, `pwritev`).
+**IOOpt** is a custom LLVM pass plugin that transparently reduces I/O syscall
+overhead. It recognises a wide range of user-space I/O calls in the IR, proves
+when it is safe to combine them, and rewrites them into fewer, larger, and
+better-shaped operations — scatter/gather vectors (`readv`/`writev`/`preadv`/`pwritev`),
+coalesced buffers, zero-copy kernel transfers, hoisted whole-loop transfers, and
+optional kernel read-ahead hints (`posix_fadvise`).
 
-
-By leveraging Link-Time Optimization (LTO), Alias Analysis, and Scalar Evolution (SCEV), IOOpt safely hoists, classifies, and coalesces I/O operations across translation unit boundaries, completely eliminating the developer burden of manual vectorization.
-
-## 🚀 Performance
-
-Tested on a range of example mini-apps (in the benchmarks directory) we see 2-3x performance improvement using this functionality.
-
----
-
-## 🧠 Architecture & Features
-
-IOOpt is built on a decoupled **Classifier and Router** architecture, enabling surgical transformation of intermediate representation (IR) based on dynamic memory layouts.
-
-* **Explicit-Offset Contiguity Tracking:** Fully supports explicit offset I/O (`pread` / `pwrite`) heavily used by database storage engines (like InnoDB). IOOpt utilizes LLVM's `ScalarEvolution` (SCEV) to mathematically prove offset contiguity algebraically, safely synthesizing `preadv` and `pwritev` arrays even when offsets are dynamically calculated at runtime.
-* **Strict Memory Hazard Protection:** Uses LLVM's `AAManager` (Alias Analysis) to detect buffer mutations between sequential I/O calls. If a hazard, file descriptor reassignment, or an opaque barrier is detected, the pass safely flushes the batch to guarantee strict ACID semantics.
-* **Loop-Exit (Lazy) Flushing:** Utilizes `LoopInfo` and `SCEVExpander` to mathematically calculate loop trip counts and stride lengths. It hoists I/O instructions out of rigid loops into the Loop-Closed SSA (LCSSA) exit block, turning $O(N)$ system calls into $O(1)$.
-* **High-Water Mark Protection:** Actively monitors batch byte-weights. To prevent overwhelming the Linux VFS allocator, it forces a pipeline flush the exact moment the batch crosses the 64KB OS Page Cache boundary.
-* **The I/O Pattern Classifier:** Automatically routes memory access patterns to the optimal silicon/OS primitive (Contiguous, Shadow Buffered, Vectored, or Strided SIMD Gather).
+All transforms are guarded by Alias Analysis (AA), Scalar Evolution (SCEV),
+Dominator/Post-Dominator trees and MemorySSA. When safety cannot be proven, the
+original calls are left untouched.
 
 ---
 
-## 🛡️ Bypassing IOOpt (Manual Opt-Out)
+## What it recognises
 
-In certain systems programming scenarios—such as writing to an `eventfd`, a network socket, or an IPC pipe to signal another process—developers rely on precise, immediate OS wake-ups. If IOOpt batches a signaling write, the receiving process may deadlock.
+IOOpt classifies calls to the following families (respecting `nobuiltin` and user
+redefinitions — only library *declarations* are treated as I/O):
 
-Because IOOpt respects strict memory semantics and standard LLVM attributes, you can easily force the pass to ignore specific I/O calls using one of the following methods. 
+* **C stdio:** `fwrite`, `fread`, `fputc`, `putc`, `_IO_putc`, `fputs`, `puts`
+* **POSIX byte I/O:** `write`, `read`, `pwrite`/`pwrite64`, `pread`/`pread64`
+* **POSIX vectored:** `preadv`/`preadv2`, `pwritev`/`pwritev2`
+* **Zero-copy:** `splice`, `sendfile`/`sendfile64`
+* **Async:** `io_submit`, `aio_write`/`aio_write64` (recognised as batch breakers)
+* **MPI-IO:** `MPI_File_write_at`, `MPI_File_read_at` (and `PMPI_*` variants)
+* **C++ streams:** `std::ostream::write`, `std::istream::read` (resolved via a
+  cached demangler lookup)
 
+`fwrite`/`fread` element/count pairs are normalised to a byte count; `fputs`/`puts`
+lengths are materialised with `strlen` at emission; `puts` gets its trailing newline
+handled explicitly.
 
+---
 
-### Method 1: The Opaque Wrapper (Targeted Opt-Out)
-Hide the system call inside a function that the LLVM pass is forbidden from inlining or analyzing. 
+## The pass pipeline
 
+IOOpt is composed of several cooperating passes so the pass manager can recompute
+analyses between mutating stages:
+
+1. **`InterProceduralIOBatchingPass`** *(module)* — Detects small "I/O wrapper"
+   functions (a function under ~80 instructions whose I/O target is one of its
+   arguments) and inlines a call to such a wrapper when it directly follows I/O on
+   the *same* file descriptor in the caller. This exposes cross-function I/O chains
+   to the later batching passes. Runs under LTO and under the explicit
+   `io-lto-merge` pipeline.
+
+2. **`IOLoopHoistingPass`** *(function)* — Uses `LoopInfo` + `ScalarEvolution` +
+   `MemorySSA` + AA to prove that a per-iteration read/write over a contiguous,
+   unit-stride buffer with a constant-length element and a computable trip count can
+   be replaced by a **single** whole-range transfer. Reads are hoisted to the
+   preheader; writes are lowered to the loop exit block. Turns *O(N)* syscalls into
+   *O(1)*.
+
+3. **`IOBatchingPass`** *(function)* — The core coalescing engine. A three-phase
+   design:
+   * **Decide:** walk each block read-only, growing per-fd batches and closing them
+     on hazards, fd reassignment, opaque calls, sync points, or the high-water mark.
+   * **Prepare:** classify each closed batch, apply the return-value availability
+     gate, and pre-expand any non-dominating vectored buffers with `SCEVExpander`
+     (insert-only, so analyses stay valid).
+   * **Emit:** pure code generation that consults no analyses.
+
+4. **`IOPrefetchPass`** *(function, opt-in)* — For analyzable, statically-bounded,
+   forward-contiguous `pread` loops, inserts a single
+   `posix_fadvise(POSIX_FADV_WILLNEED)` over the exact range the loop will consume.
+
+5. **`IOSequentialPrefetchPass`** *(function, opt-in)* — Emits a whole-file
+   `posix_fadvise` mode hint:
+   * `SEQUENTIAL` for `read`/`fread` loops (unless a seek perturbs the position) and
+     for contiguous / small-gap `pread` addrecs;
+   * `RANDOM` for large-strided, backwards, non-affine, or non-constant-stride
+     `pread` loops (to *suppress* wasteful read-ahead).
+
+---
+
+## The I/O Pattern Classifier
+
+Each safe batch is routed to the cheapest correct primitive:
+
+| Pattern | Trigger | Emitted form |
+|---|---|---|
+| **Contiguous** | buffers are physically adjacent (proved via SCEV or constant offset) | one call over the merged range; `splice`/`sendfile` counted as **zero-copy** |
+| **Strided (SIMD gather)** | 2–64 writes of a uniform 1/2/4/8-byte element | vector load/insert into a stack shadow, one store, one write |
+| **Static ShadowBuffer** | all lengths constant, total ≤ `IO_SHADOW_BUFFER_MAX` | stack alloca + `memcpy` packing + one call |
+| **Dynamic ShadowBuffer** | batch ≥ threshold but sizes not all constant | aligned heap buffer via `posix_memalign` (with failure trap → `dprintf`+`abort`), packing, one `fwrite`/call, then `free` |
+| **Vectored** | POSIX read/write batches | `readv`/`writev`/`preadv`/`pwritev`; auto-split when `iovcnt > IO_MAX_IOV` |
+| **CharGather** | a run of `fputc`/`putc` | bytes gathered into one buffer, flushed with a single `fwrite` |
+
+For explicit-offset I/O (`pread`/`pwrite`) and MPI `*_at`, contiguity is proved
+**algebraically** on the offsets via SCEV, so dynamically-computed offsets are still
+mergeable.
+
+### Faithful return-value reconstruction
+Merging changes the return values callers would have seen. IOOpt rebuilds each
+original call's result from the merged result (byte-count clamping per slice, error
+propagation, `fread`/`fwrite` element-count division, `fputc`/`fputs`/`puts` success
+codes, C++ stream identity, MPI `MPI_SUCCESS`). If any *used* return value would be
+needed *before* the merge point, the batch is rejected outright rather than
+mis-optimised.
+
+---
+
+## Safety model
+
+* **Alias / hazard analysis:** intervening reads/writes that touch a batched buffer,
+  the file-stream object, or the fd slot break the batch (RAW/WAW for reads,
+  WAR for writes).
+* **Opaque calls** break batches unless proven pure or provably I/O-free
+  (recursive `isDeeplySafeFromIO` scan); a curated allow-list covers `strlen`,
+  byte-swap/endian helpers, etc.
+* **Control flow:** a batch may only extend across blocks that post-dominate the
+  last call and remain dominated by it.
+* **Sync points** (`fsync`, `fdatasync`, `msync`, `sync_file_range`, `close`,
+  `fclose`, `fflush`, `posix_fadvise`) flush the affected fd; `madvise` flushes
+  everything.
+* **Volatile** loads/stores/mem-intrinsics are always respected.
+
+### ⚠️ Atomicity / message-boundary caveat
+Merging N writes into one `writev`, or collapsing a loop into one transfer, changes
+`PIPE_BUF` atomicity on pipes/FIFOs and message boundaries on datagram/seqpacket
+sockets. IOOpt cannot prove "regular file" from IR, so this is governed by a single
+honest switch: **`-io-opt-assume-regular-files` (default: on)**. Disable it if your
+batched fds may be pipes, FIFOs, or datagram/seqpacket sockets.
+
+---
+
+## Control flags (CLI)
+
+These are LLVM `cl::opt` booleans. Pass them to the plugin via `-mllvm` (or
+`-Wl,-mllvm,...` at LTO link time).
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-enable-io-opt` | `true` | Master enable for batching/hoisting transforms. |
+| `-io-opt-assume-regular-files` | `true` | Assume batched fds are regular files (see caveat). |
+| `-io-opt-early-ipo` | `false` | Also inject interprocedural wrapper inlining at pipeline *start* (the explicit `io-lto-merge` pipeline always runs it regardless). |
+| `-io-opt-prefetch` | `false` | **Master opt-in** for the entire `posix_fadvise` prefetch family. |
+| `-io-opt-prefetch-willneed` | `true` | (needs `-io-opt-prefetch`) WILLNEED for analyzable `pread` ranges. |
+| `-io-opt-prefetch-sequential` | `true` | (needs `-io-opt-prefetch`) SEQUENTIAL for monotonic contiguous read loops. |
+| `-io-opt-prefetch-random` | `true` | (needs `-io-opt-prefetch`) RANDOM to suppress read-ahead on strided/non-affine `pread` loops. |
+
+> **Why prefetch is off by default:** on random-access workloads (databases,
+> chunked HDF5) a SEQUENTIAL hint widens kernel read-ahead and pollutes the page
+> cache — a probable read regression. Prefetch is only requested deliberately.
+
+## Tuning knobs (environment variables)
+
+Numeric thresholds are read from the environment at load time. A value of `0` (or an
+unparseable value) falls back to the default for threshold-style variables.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IO_BATCH_THRESHOLD` | `4` | Minimum scattered calls before preferring vectored/dynamic forms. |
+| `IO_SHADOW_BUFFER_MAX` | `4096` | Max bytes packed on the stack (static ShadowBuffer / CharGather). |
+| `IO_HIGH_WATER_MARK` | `65536` | Cumulative bytes that force a batch flush. |
+| `IO_MAX_IOV` | `1024` | Max `iovcnt`; larger batches are split. |
+| `IO_PREFETCH_MIN_BYTES` | `65536` | Smallest WILLNEED range worth a syscall. |
+| `IO_PREFETCH_MAX_BYTES` | `134217728` | Largest WILLNEED range (avoid cache pollution). |
+| `IO_PREFETCH_RANDOM_GAP` | `4096` | Stride gap beyond which a `pread` loop is classed RANDOM. |
+| `IO_ENABLE_LOGGING` | `0` | Set non-zero to emit `[IOOpt]` diagnostics to stderr. |
+
+Statistics (`NumBatchesMerged`, `NumLoopsHoisted`, `NumZeroCopy`, `NumIPAInlines`,
+`NumPrefetchHints`, `NumSeqHints`, `NumRandomHints`, …) are available via LLVM's
+`-stats` machinery.
+
+---
+
+## Bypassing IOOpt (manual opt-out)
+
+For signalling writes (eventfd, sockets, IPC pipes) where immediate delivery
+matters, you can force IOOpt to leave a call alone:
+
+### Method 1 — opaque wrapper
 ```c
 #include <unistd.h>
-
-// __attribute__((noinline)) prevents Clang from unpacking this
-// __attribute__((optnone)) hides it from the LTO pass entirely
 __attribute__((noinline, optnone))
 static ssize_t write_signal(int fd, const void *buf, size_t count) {
-    return write(fd, buf, count); // IOOpt will ignore this!
+    return write(fd, buf, count); // hidden from IOOpt
 }
 ```
 
-### Method 2: The Inline Assembly Barrier (Block-Level Opt-Out)
-If you want to manually chop up a massive sequential block of I/O without changing your function calls, drop a zero-cost compiler memory barrier into your code. IOOpt treats this as an opaque memory hazard and will instantly flush any pending I/O batches.
-
+### Method 2 — inline-assembly barrier
 ```c
 #define IO_OPT_BARRIER() __asm__ volatile("" ::: "memory")
 
-write(fd, data1, 10); // IOOpt batches this...
-write(fd, data2, 10); // ...with this.
-
-IO_OPT_BARRIER();     // <--- IOOpt hits this and flushes the batch!
-
-write(ipc_fd, sig, 1); // This signaling write executes immediately and alone.
-
-IO_OPT_BARRIER();     // <--- Another barrier protects it from the bottom.
-
-write(fd, data3, 10); // IOOpt starts a new batch here.
+write(fd, data1, 10);   // batched...
+write(fd, data2, 10);   // ...with this.
+IO_OPT_BARRIER();       // opaque memory hazard -> flush
+write(ipc_fd, sig, 1);  // executes immediately, alone
+IO_OPT_BARRIER();
+write(fd, data3, 10);   // new batch starts here
 ```
+
+You can also disable batching globally with `-enable-io-opt=false`, or turn off
+merges that change socket/pipe semantics with `-io-opt-assume-regular-files=false`.
 
 ---
 
-## 🛠️ Building and Installation
+## Building
 
 ### Prerequisites
 * LLVM / Clang 20.0+
 * CMake 3.10+
-* C++17 Compiler
+* A C++17 compiler
+* `lit` (only to run the test suite)
 
-If you want to run the tests you will also require:
-* lit
+> **ABI note:** the plugin defines `EnableABIBreakingChecks` /
+> `DisableABIBreakingChecks` so it can be loaded by `clang`/`lld` during LTO. This is
+> only safe if the plugin is built against an LLVM with the **identical**
+> `LLVM_ENABLE_ABI_BREAKING_CHECKS` setting as the host tool that loads it. Keep them
+> in lockstep.
 
-### Compilation
 ```bash
 git clone https://github.com/adrianjhpc/IOOptCompilerPass.git
 cd IOOpt
@@ -88,26 +222,27 @@ cmake ..
 make -j$(nproc)
 ```
 
-### Running the Test Suite
-IOOpt includes a `lit` suite verifying the maths, hazards, offset contiguity, and LCSSA dominance rules.
+### Running the tests
 ```bash
 make test
 ```
 
 ---
 
-## 💻 Usage
+## Usage
 
-To compile your application with IOOpt, you must inject it into the Clang LTO linker pipeline.
+### As part of an optimised / LTO build
+Loading the plugin registers the function pipeline at *OptimizerLast*, so it runs at
+`-O2`/`-O3`; under full LTO the interprocedural inliner runs as well.
 
-**For a standard Makefile/C project:**
+**Makefile / C project:**
 ```bash
 export CFLAGS="-O3 -flto"
 export LDFLAGS="-flto -Wl,--load-pass-plugin=/path/to/libIOOpt.so"
 make
 ```
 
-**For CMake projects (e.g., MySQL):**
+**CMake project:**
 ```bash
 cmake . \
   -DCMAKE_C_COMPILER=clang \
@@ -117,18 +252,26 @@ cmake . \
   -DCMAKE_EXE_LINKER_FLAGS="-flto -Wl,--load-pass-plugin=/path/to/libIOOpt.so"
 ```
 
-### Tunable CLI Parameters
-IOOpt behavior can be tuned by passing LLVM standard arguments during the linking phase:
-* `-io-batch-threshold=<int>`: Minimum scattered calls required to trigger `writev` (Default: 4).
-* `-io-shadow-buffer-max=<int>`: Maximum bytes to safely pack on the stack (Default: 4096).
-* `-io-high-water-mark=<int>`: Maximum cumulative bytes before forcing a VFS flush (Default: 65536).
+### Explicit `opt` pipelines
+```bash
+# Function-level: hoist, batch, then (opt-in) prefetch
+opt -load-pass-plugin=./libIOOpt.so -passes=io-opt in.ll -S -o out.ll
+
+# Module-level: interprocedural wrapper inlining + full function pipeline
+opt -load-pass-plugin=./libIOOpt.so -passes=io-lto-merge in.ll -S -o out.ll
+```
+
+Enable prefetch hints:
+```bash
+opt -load-pass-plugin=./libIOOpt.so \
+    -io-opt-prefetch -io-opt-prefetch-sequential \
+    -passes=io-opt in.ll -S -o out.ll
+```
 
 ---
 
 ## Authors
-Adrian Jackson 
+Adrian Jackson
 
----
-
-## 📜 License
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
+## License
+Apache 2.0 — see [LICENSE](LICENSE).
