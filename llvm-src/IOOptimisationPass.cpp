@@ -77,24 +77,24 @@ STATISTIC(NumLoopsVectorCollapsed, "Number of scatter I/O loops collapsed to wri
 // --- Master enable + gating flags (Don't transform aggressively just
 // because the plugin is loaded). ---
 static cl::opt<bool>
-    EnableIOOpt("enable-io-opt", cl::init(true), cl::Hidden,
-                cl::desc("Enable IOOpt I/O batching/hoisting transforms"));
+EnableIOOpt("enable-io-opt", cl::init(true), cl::Hidden,
+	    cl::desc("Enable IOOpt I/O batching/hoisting transforms"));
 
 static cl::opt<bool> EnableEarlyIPO(
-    "io-opt-early-ipo", cl::init(false), cl::Hidden,
-    cl::desc("Enable IOOpt interprocedural I/O wrapper inlining via *implicit* "
-             "pipeline injection (off by default; explicit io-lto-merge always "
-             "runs it)"));
+				    "io-opt-early-ipo", cl::init(false), cl::Hidden,
+				    cl::desc("Enable IOOpt interprocedural I/O wrapper inlining via *implicit* "
+					     "pipeline injection (off by default; explicit io-lto-merge always "
+					     "runs it)"));
 
 // Atomicity / message-boundary caveat. Merging N writes into one writev
 // changes atomicity on pipes/FIFOs (PIPE_BUF) and message boundaries on
 // datagram/seqpacket sockets. We cannot prove "regular file" from IR, so this is
 // the honest lever. Default true preserves batching; set false to be strict.
 static cl::opt<bool> AssumeRegularFiles(
-    "io-opt-assume-regular-files", cl::init(true), cl::Hidden,
-    cl::desc("Assume batched fds are regular files. Disable if pipes, FIFOs, or "
-             "datagram/seqpacket sockets may be batched (atomicity/message "
-             "boundaries would otherwise change)."));
+					"io-opt-assume-regular-files", cl::init(true), cl::Hidden,
+					cl::desc("Assume batched fds are regular files. Disable if pipes, FIFOs, or "
+						 "datagram/seqpacket sockets may be batched (atomicity/message "
+						 "boundaries would otherwise change)."));
 
 // Master opt-in for the whole prefetch family. Now OFF by default.
 // Rationale: on random-access workloads (databases, chunked HDF5) a SEQUENTIAL
@@ -102,32 +102,32 @@ static cl::opt<bool> AssumeRegularFiles(
 // as a probable read regression. Prefetch is only a win for genuinely
 // streaming access, so it must be requested deliberately.
 static cl::opt<bool> EnablePrefetch(
-    "io-opt-prefetch", cl::init(false), cl::Hidden,
-    cl::desc("Master opt-in for ALL IOOpt prefetch hints "
-             "(WILLNEED/SEQUENTIAL/RANDOM). Off by default."));
+				    "io-opt-prefetch", cl::init(false), cl::Hidden,
+				    cl::desc("Master opt-in for ALL IOOpt prefetch hints "
+					     "(WILLNEED/SEQUENTIAL/RANDOM). Off by default."));
 
 // Sub-switches (only meaningful when -io-opt-prefetch is set).
 static cl::opt<bool> EnableWillNeed(
-    "io-opt-prefetch-willneed", cl::init(true), cl::Hidden,
-    cl::desc("(Requires -io-opt-prefetch) WILLNEED for analyzable pread ranges."));
+				    "io-opt-prefetch-willneed", cl::init(true), cl::Hidden,
+				    cl::desc("(Requires -io-opt-prefetch) WILLNEED for analyzable pread ranges."));
 
 static cl::opt<bool> EnableSeqPrefetch(
-    "io-opt-prefetch-sequential", cl::init(true), cl::Hidden,
-    cl::desc("(Requires -io-opt-prefetch) SEQUENTIAL for monotonic contiguous "
-             "read loops."));
+				       "io-opt-prefetch-sequential", cl::init(true), cl::Hidden,
+				       cl::desc("(Requires -io-opt-prefetch) SEQUENTIAL for monotonic contiguous "
+						"read loops."));
 
 static cl::opt<bool> EnableRandomPrefetch(
-    "io-opt-prefetch-random", cl::init(true), cl::Hidden,
-    cl::desc("(Requires -io-opt-prefetch) RANDOM to SUPPRESS readahead on "
-             "large-strided or non-affine pread loops."));
+					  "io-opt-prefetch-random", cl::init(true), cl::Hidden,
+					  cl::desc("(Requires -io-opt-prefetch) RANDOM to SUPPRESS readahead on "
+						   "large-strided or non-affine pread loops."));
 
 // --- copy_file_range promotion (read+write / pread+pwrite bounce buffer -> one
 // in-kernel copy). OFF by default: it changes the syscall surface and has real
 // EXDEV/ENOSYS edge cases (see fallback below). ---
 static cl::opt<bool> EnableCopyFileRange(
-    "io-opt-copy-file-range", cl::init(false), cl::Hidden,
-    cl::desc("Promote read+write / pread+pwrite bounce-buffer copies into a "
-             "single copy_file_range (opt-in)."));
+					 "io-opt-copy-file-range", cl::init(false), cl::Hidden,
+					 cl::desc("Promote read+write / pread+pwrite bounce-buffer copies into a "
+						  "single copy_file_range (opt-in)."));
 
 // Emit a runtime fallback that re-runs the original read/write when
 // copy_file_range fails with ENOSYS (old kernel) or EXDEV (cross-filesystem).
@@ -135,23 +135,28 @@ static cl::opt<bool> EnableCopyFileRange(
 // cross-mount copy into a hard failure. Both errnos occur *before* any bytes are
 // copied, so the fallback re-read/-write starts from an unperturbed position.
 static cl::opt<bool> EnableCFRFallback(
-    "io-opt-cfr-fallback", cl::init(true), cl::Hidden,
-    cl::desc("Guard copy_file_range with a read/write fallback on ENOSYS/EXDEV "
-             "(preserves old-kernel / cross-filesystem correctness)."));
+				       "io-opt-cfr-fallback", cl::init(true), cl::Hidden,
+				       cl::desc("Guard copy_file_range with a read/write fallback on ENOSYS/EXDEV "
+						"(preserves old-kernel / cross-filesystem correctness)."));
 
 // Also match copies whose write length is a *constant equal to the read count*
 // (i.e. code that ignores the read return and assumes a full read). This changes
 // behaviour on the short-read/EOF edge, so it is a deliberate, separate opt-in.
 static cl::opt<bool> CFRAssumeFullReads(
-    "io-opt-cfr-assume-full-reads", cl::init(false), cl::Hidden,
-    cl::desc("(Requires -io-opt-copy-file-range) Also match copies whose write "
-             "length is a constant equal to the read count."));
+					"io-opt-cfr-assume-full-reads", cl::init(false), cl::Hidden,
+					cl::desc("(Requires -io-opt-copy-file-range) Also match copies whose write "
+						 "length is a constant equal to the read count."));
 
 
 static cl::opt<bool> EnableLoopVectored(
-    "io-opt-loop-vectored", cl::init(false), cl::Hidden,
-    cl::desc("Collapse a loop of scattered write/pwrite into one "
-             "writev/pwritev (opt-in)."));
+					"io-opt-loop-vectored", cl::init(false), cl::Hidden,
+					cl::desc("Collapse a loop of scattered write/pwrite into one "
+						 "writev/pwritev (opt-in)."));
+
+static cl::opt<bool> EnableDynamicTrips(
+					"io-opt-loop-hoist-dynamic-trips", cl::init(false), cl::Hidden,
+					cl::desc("Allow loop I/O collapse with a runtime (symbolic) trip "
+						 "count; uses a conservative AA range (opt-in)."));
 
 static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
   const char *Val = std::getenv(Name);
@@ -335,8 +340,8 @@ namespace {
         isSymbolName(Name, "_IO_putc")) {
       if (!need(2) || !isInt(0) || !isPtr(1)) return NONE;
       IOArgs A{Call->getArgOperand(1), /*Buffer=*/nullptr,
-               ConstantInt::get(Type::getInt64Ty(Call->getContext()), 1),
-               IOArgs::C_FPUTC};
+	ConstantInt::get(Type::getInt64Ty(Call->getContext()), 1),
+	IOArgs::C_FPUTC};
       A.ScalarData = Call->getArgOperand(0);   // the char (as int)
       return A;
     }
@@ -346,7 +351,7 @@ namespace {
       if (!need(2) || !isPtr(0) || !isPtr(1)) return NONE;
       // Length = strlen(s), materialized at emission (can't insert IR here).
       return {Call->getArgOperand(1), Call->getArgOperand(0), /*Length=*/nullptr,
-              IOArgs::C_FPUTS};
+	IOArgs::C_FPUTS};
     }
     // int puts(const char *s);  -> writes s + '\n' to stdout.
     if (isSymbolName(Name, "puts")) {
@@ -357,7 +362,7 @@ namespace {
       // does NOT rely on this key: the hazard scan in isSafeToAddToBatch treats
       // every intervening I/O/opaque call (incl. fflush) as a batch-breaker.
       return {/*Target=*/F, Call->getArgOperand(0), /*Length=*/nullptr,
-              IOArgs::C_PUTS};
+	IOArgs::C_PUTS};
     }
     if (isSymbolName(Name, "preadv") || isSymbolName(Name, "preadv2")) {
       if (!need(3) || !isPtr(1)) return NONE;
@@ -398,7 +403,7 @@ namespace {
     if (Cxx != 0) {
       if (!need(3)) return NONE;
       return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2),
-              Cxx == 1 ? IOArgs::CXX_WRITE : IOArgs::CXX_READ};
+	Cxx == 1 ? IOArgs::CXX_WRITE : IOArgs::CXX_READ};
     }
 
     return NONE;
@@ -1045,7 +1050,7 @@ namespace {
       // dominates Batch.back(), so this dominates the merge/insert point).
       if (!StrlenFn)
         StrlenFn = M->getOrInsertFunction(
-            "strlen", FunctionType::get(SizeTy, {InsertBuilder.getPtrTy()}, false));
+					  "strlen", FunctionType::get(SizeTy, {InsertBuilder.getPtrTy()}, false));
       IRBuilder<> SB(Batch[i]);
       Value *S = A.Buffer;
       if (S->getType() != SB.getPtrTy() && S->getType()->isPointerTy())
@@ -1141,7 +1146,7 @@ namespace {
         IRBuilder<> CallBuilder(C);
         // Use 64-bit GEP indices to avoid silent truncation.
         Value *DestPtr = CallBuilder.CreateInBoundsGEP(
-            ShadowArrTy, ShadowBuf, {CallBuilder.getInt64(0), CallBuilder.getInt64(CurrentOffset)});
+						       ShadowArrTy, ShadowBuf, {CallBuilder.getInt64(0), CallBuilder.getInt64(CurrentOffset)});
         CallBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Args.Length);
         if (auto *ConstLen = dyn_cast_or_null<ConstantInt>(Args.Length)) CurrentOffset += ConstLen->getZExtValue();
       }
@@ -1210,7 +1215,7 @@ namespace {
       Value *SizeVal = TrapBuilder.CreateLoad(SizeTy, SizeSlot, "ioopt.pmem.size.val");
 
       Value *Fmt = TrapBuilder.CreateGlobalString(
-          "IOOpt: posix_memalign failed (rc=%d, size=%zu)\\n", "ioopt.pmem.fmt");
+						  "IOOpt: posix_memalign failed (rc=%d, size=%zu)\\n", "ioopt.pmem.fmt");
 
       TrapBuilder.CreateCall(DprintfFn, {TrapBuilder.getInt32(2), Fmt, RCVal, SizeVal});
       TrapBuilder.CreateCall(AbortFn);
@@ -1239,7 +1244,7 @@ namespace {
         Value *Stream;
         if (FirstArgs.Type == IOArgs::C_PUTS) {
           GlobalVariable *StdoutG =
-              cast<GlobalVariable>(M->getOrInsertGlobal("stdout", PtrTy));
+	    cast<GlobalVariable>(M->getOrInsertGlobal("stdout", PtrTy));
           Stream = ContBuilder.CreateLoad(PtrTy, StdoutG, "ioopt.stdout");
         } else {
           Stream = FirstArgs.Target;
@@ -1247,10 +1252,10 @@ namespace {
             Stream = ContBuilder.CreatePointerBitCastOrAddrSpaceCast(Stream, PtrTy);
         }
         FunctionCallee Fwrite = M->getOrInsertFunction(
-            "fwrite", FunctionType::get(SizeTy, {PtrTy, SizeTy, SizeTy, PtrTy}, false));
+						       "fwrite", FunctionType::get(SizeTy, {PtrTy, SizeTy, SizeTy, PtrTy}, false));
         Value *Count = ContBuilder.CreateZExtOrTrunc(TotalDynLen, SizeTy);
         MergedCall = ContBuilder.CreateCall(
-            Fwrite, {HeapBuf, ConstantInt::get(SizeTy, 1), Count, Stream});
+					    Fwrite, {HeapBuf, ConstantInt::get(SizeTy, 1), Count, Stream});
       } else {
         MergedCall = ContBuilder.CreateCall(Batch[0]->getCalledFunction(), buildArgs(HeapBuf));
       }
@@ -1320,14 +1325,14 @@ namespace {
         IRBuilder<> CallBuilder(Batch[i]);
         Value *Byte = CallBuilder.CreateTrunc(Args.ScalarData, Int8Ty, "fputc.byte");
         Value *Slot = CallBuilder.CreateInBoundsGEP(
-            ArrTy, CharBuf, {CallBuilder.getInt64(0), CallBuilder.getInt64(i)});
+						    ArrTy, CharBuf, {CallBuilder.getInt64(0), CallBuilder.getInt64(i)});
         CallBuilder.CreateStore(Byte, Slot);
       }
 
       Type *SizeTy = DL.getIntPtrType(M->getContext());
       PointerType *PtrTy = InsertBuilder.getPtrTy();
       FunctionCallee Fwrite = M->getOrInsertFunction(
-          "fwrite", FunctionType::get(SizeTy, {PtrTy, SizeTy, SizeTy, PtrTy}, false));
+						     "fwrite", FunctionType::get(SizeTy, {PtrTy, SizeTy, SizeTy, PtrTy}, false));
 
       Value *BufPtr = InsertBuilder.CreatePointerCast(CharBuf, PtrTy);
       Value *StreamPtr = FirstArgs.Target;
@@ -1335,8 +1340,8 @@ namespace {
         StreamPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(StreamPtr, PtrTy);
 
       MergedCall = InsertBuilder.CreateCall(
-          Fwrite, {BufPtr, ConstantInt::get(SizeTy, 1),
-                   ConstantInt::get(SizeTy, Batch.size()), StreamPtr});
+					    Fwrite, {BufPtr, ConstantInt::get(SizeTy, 1),
+					     ConstantInt::get(SizeTy, Batch.size()), StreamPtr});
       NumBatchesMerged++;
       logMessage("[IOOpt] SUCCESS: Coalesced " + Twine(Batch.size()) +
                  " fputc/putc calls into one fwrite.");
@@ -1368,8 +1373,8 @@ namespace {
     bool RetIsInt = RetTy->isIntegerTy();
     Value *R = MergedCall;
     Value *IsErr = RetIsInt
-        ? RetBuilder.CreateICmpSLT(R, ConstantInt::get(RetTy, 0), "io.iserr")
-        : nullptr;
+      ? RetBuilder.CreateICmpSLT(R, ConstantInt::get(RetTy, 0), "io.iserr")
+      : nullptr;
     Value *Prefix = RetIsInt ? ConstantInt::get(RetTy, 0) : nullptr;
 
     SmallVector<CallInst*, 8> ToErase;
@@ -1401,17 +1406,17 @@ namespace {
         // success, EOF (-1) on error.
         Value *Wrote = RetBuilder.CreateICmpUGT(R, Prefix, "io.fputc.ok");
         Value *CharI = RetBuilder.CreateAnd(
-            RetBuilder.CreateIntCast(CArgs.ScalarData, C->getType(), /*isSigned=*/false),
-            ConstantInt::get(C->getType(), 0xFF));
+					    RetBuilder.CreateIntCast(CArgs.ScalarData, C->getType(), /*isSigned=*/false),
+					    ConstantInt::get(C->getType(), 0xFF));
         Rep = RetBuilder.CreateSelect(
-            Wrote, CharI, ConstantInt::get(C->getType(), (uint64_t)-1), "io.fputc.ret");
+				      Wrote, CharI, ConstantInt::get(C->getType(), (uint64_t)-1), "io.fputc.ret");
       } else if (CArgs.Type == IOArgs::C_FPUTS || CArgs.Type == IOArgs::C_PUTS) {
         // fwrite (elem size 1) returns bytes written. This call fully succeeded
         // iff R reached the end of its slice. fputs/puts: >=0 on success, EOF on error.
         Value *End = RetBuilder.CreateAdd(Prefix, Contrib);
         Value *Ok  = RetBuilder.CreateICmpUGE(R, End, "io.fputs.ok");
         Rep = RetBuilder.CreateSelect(Ok, ConstantInt::get(RetTy, 0),
-                 ConstantInt::get(RetTy, (uint64_t)-1), "io.fputs.ret");
+				      ConstantInt::get(RetTy, (uint64_t)-1), "io.fputs.ret");
         if (C->getType() != Rep->getType())
           Rep = RetBuilder.CreateIntCast(Rep, C->getType(), true);
       } else if (RetIsInt && Contrib) {
@@ -1471,8 +1476,8 @@ namespace {
     }
 
     static bool isSafeToHoistLoopIOCall(CallInst *Call, const IOArgs &Args, Loop *L,
-                                        ScalarEvolution &SE, const DataLayout &DL,
-                                        AAResults &AA, DominatorTree &DT, MemorySSA &MSSA) {
+					ScalarEvolution &SE, const DataLayout &DL,
+					AAResults &AA, DominatorTree &DT, MemorySSA &MSSA) {
       if (!Args.Buffer || !Args.Length) return false;
       if (!isa<ConstantInt>(Args.Length)) return false;
 
@@ -1480,24 +1485,31 @@ namespace {
       uint64_t ElemLen = LenC->getZExtValue();
       if (ElemLen == 0) return false;
 
+      // --- Trip count: constant, or (opt-in) symbolic/runtime. ---
       const SCEV *BackedgeCount = SE.getBackedgeTakenCount(L);
       if (isa<SCEVCouldNotCompute>(BackedgeCount)) return false;
-      auto *BEC = dyn_cast<SCEVConstant>(BackedgeCount);
-      if (!BEC) return false;
 
-      uint64_t Trips = BEC->getAPInt().getZExtValue() + 1;
-      if (Trips == 0) return false;
-      if (Trips > (std::numeric_limits<uint64_t>::max() / ElemLen)) return false;
-      uint64_t TotalLen = Trips * ElemLen;
+      bool DynamicTrips = !isa<SCEVConstant>(BackedgeCount);
+      if (DynamicTrips && !EnableDynamicTrips) return false;
 
+      uint64_t TotalLen = 0;                       // only meaningful when !DynamicTrips
+      if (!DynamicTrips) {
+	auto *BEC = cast<SCEVConstant>(BackedgeCount);
+	uint64_t Trips = BEC->getAPInt().getZExtValue() + 1;
+	if (Trips == 0) return false;
+	if (Trips > (std::numeric_limits<uint64_t>::max() / ElemLen)) return false;
+	TotalLen = Trips * ElemLen;
+      }
+
+      // --- Buffer must be a unit-stride (step == ElemLen) affine addrec in L. ---
       const SCEV *BufS = SE.getSCEV(Args.Buffer);
       auto *BufAR = dyn_cast<SCEVAddRecExpr>(BufS);
       if (!BufAR || BufAR->getLoop() != L) return false;
 
-      const SCEV *BufStep = SE.getTruncateOrZeroExtend(BufAR->getStepRecurrence(SE),
-                                                       DL.getIntPtrType(Call->getContext()));
-      const SCEV *ElemS  = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length),
-                                                      DL.getIntPtrType(Call->getContext()));
+      const SCEV *BufStep = SE.getTruncateOrZeroExtend(BufAR->getStepRecurrence(SE), DL.getIntPtrType(Call->getContext()));
+						       
+      const SCEV *ElemS = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), DL.getIntPtrType(Call->getContext()));
+						     
       if (!SE.isKnownNonNegative(BufStep)) return false;
       if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, BufStep, ElemS)) return false;
 
@@ -1507,22 +1519,26 @@ namespace {
       Value *BasePtr = U->getValue();
       if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
 
-      // --- Explicit-offset contiguity proof ---------------------------
+      // --- Explicit-offset (pread/pwrite) contiguity: offset step == ElemLen.
+      //     Runs for both constant and dynamic trip counts. ---
       if (Args.Type == IOArgs::POSIX_PREAD || Args.Type == IOArgs::POSIX_PWRITE) {
-        Value *OffV = Call->getArgOperand(3);
-        if (!SE.isSCEVable(OffV->getType())) return false;
- 
-        Type *IdxTy = DL.getIntPtrType(Call->getContext());
-        auto *OffAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
-        if (!OffAR || OffAR->getLoop() != L || !OffAR->isAffine()) return false;
-        if (!SE.isLoopInvariant(OffAR->getStart(), L)) return false;
-
-        const SCEV *OffStep = SE.getTruncateOrZeroExtend(OffAR->getStepRecurrence(SE), IdxTy);
-        const SCEV *ElemS   = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), IdxTy);
-        if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, OffStep, ElemS)) return false;
+	Value *OffV = Call->getArgOperand(3);
+	if (!SE.isSCEVable(OffV->getType())) return false;
+	Type *IdxTy = DL.getIntPtrType(Call->getContext());
+	auto *OffAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+	if (!OffAR || OffAR->getLoop() != L || !OffAR->isAffine()) return false;
+	if (!SE.isLoopInvariant(OffAR->getStart(), L)) return false;
+	const SCEV *OffStep = SE.getTruncateOrZeroExtend(OffAR->getStepRecurrence(SE), IdxTy);
+	const SCEV *OffElem = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), IdxTy);
+	if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, OffStep, OffElem)) return false;
       }
 
-      MemoryLocation FullRange(BasePtr, LocationSize::precise(TotalLen));
+      // --- Hazard filter range: precise when the byte count is known, else
+      //     conservative (unbounded) for the symbolic case. ---
+      MemoryLocation FullRange =
+	DynamicTrips ? MemoryLocation(BasePtr, LocationSize::beforeOrAfterPointer())
+	: MemoryLocation(BasePtr, LocationSize::precise(TotalLen));
+
 
       for (BasicBlock *BB : L->blocks()) {
         for (Instruction &I : *BB) {
@@ -1560,185 +1576,185 @@ namespace {
     }
 
     // Collapse a loop of scattered, non-overlapping
-// write/pwrite into ONE writev/pwritev, moving only pointers (no data copy).
-// Returns true (and mutates the loop) on success; caller must then refetch
-// analyses. Writes only; unused return only.
-static bool tryVectoredLoopCollapse(CallInst *Call, const IOArgs &Args, Loop *L,
-                                    ScalarEvolution &SE, const DataLayout &DL,
-                                    AAResults &AA, DominatorTree &DT,
-                                    MemorySSA &MSSA) {
-  Module *M = Call->getModule();
-  LLVMContext &C = M->getContext();
-  Function *F = Call->getFunction();
+    // write/pwrite into ONE writev/pwritev, moving only pointers (no data copy).
+    // Returns true (and mutates the loop) on success; caller must then refetch
+    // analyses. Writes only; unused return only.
+    static bool tryVectoredLoopCollapse(CallInst *Call, const IOArgs &Args, Loop *L,
+					ScalarEvolution &SE, const DataLayout &DL,
+					AAResults &AA, DominatorTree &DT,
+					MemorySSA &MSSA) {
+      Module *M = Call->getModule();
+      LLVMContext &C = M->getContext();
+      Function *F = Call->getFunction();
 
-  // --- Structural preconditions (LoopSimplify guarantees single pre/latch). ---
-  BasicBlock *Pre   = L->getLoopPreheader();
-  BasicBlock *Head  = L->getHeader();
-  BasicBlock *Latch = L->getLoopLatch();
-  BasicBlock *Exit  = L->getExitBlock();
-  if (!Pre || !Head || !Latch || !Exit) return false;
-  if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT)) return false;
+      // --- Structural preconditions (LoopSimplify guarantees single pre/latch). ---
+      BasicBlock *Pre   = L->getLoopPreheader();
+      BasicBlock *Head  = L->getHeader();
+      BasicBlock *Latch = L->getLoopLatch();
+      BasicBlock *Exit  = L->getExitBlock();
+      if (!Pre || !Head || !Latch || !Exit) return false;
+      if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT)) return false;
 
-  const bool Explicit = (Args.Type == IOArgs::POSIX_PWRITE);
-  Type *IntPtrTy = DL.getIntPtrType(C);
+      const bool Explicit = (Args.Type == IOArgs::POSIX_PWRITE);
+      Type *IntPtrTy = DL.getIntPtrType(C);
 
-  // --- Constant trip count N in [2, MaxIov]. ---
-  auto *BEC = dyn_cast<SCEVConstant>(SE.getBackedgeTakenCount(L));
-  if (!BEC) return false;
-  const APInt &BECi = BEC->getAPInt();
-  if (BECi.getActiveBits() > 62) return false;
-  uint64_t N = BECi.getZExtValue() + 1;
-  if (N < 2 || N > Config.MaxIov) return false;
+      // --- Constant trip count N in [2, MaxIov]. ---
+      auto *BEC = dyn_cast<SCEVConstant>(SE.getBackedgeTakenCount(L));
+      if (!BEC) return false;
+      const APInt &BECi = BEC->getAPInt();
+      if (BECi.getActiveBits() > 62) return false;
+      uint64_t N = BECi.getZExtValue() + 1;
+      if (N < 2 || N > Config.MaxIov) return false;
 
-  // --- Constant per-call byte count. ---
-  auto *LenC = dyn_cast_or_null<ConstantInt>(Args.Length);
-  if (!LenC) return false;
-  uint64_t Count = LenC->getZExtValue();
-  if (Count == 0) return false;
+      // --- Constant per-call byte count. ---
+      auto *LenC = dyn_cast_or_null<ConstantInt>(Args.Length);
+      if (!LenC) return false;
+      uint64_t Count = LenC->getZExtValue();
+      if (Count == 0) return false;
 
-  // --- Buffer addrec: affine, constant stride, non-overlapping & forward. ---
-  //   stride == count is (scalar) already handled and fires before this; here we
-  //   require stride >= count. stride <= 0 rejects scratch reuse (==0) and
-  //   backwards (<0), both fatal to deferral.
-  auto *BufAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(Args.Buffer));
-  if (!BufAR || BufAR->getLoop() != L || !BufAR->isAffine()) return false;
-  if (!SE.isLoopInvariant(BufAR->getStart(), L)) return false;
-  auto *StepC = dyn_cast<SCEVConstant>(BufAR->getStepRecurrence(SE));
-  if (!StepC) return false;
-  const APInt &StepA = StepC->getAPInt();
-  if (StepA.isNonPositive() || StepA.getActiveBits() > 62) return false;
-  uint64_t Stride = StepA.getZExtValue();
-  if (Stride < Count) return false;                    // overlap -> unsafe
+      // --- Buffer addrec: affine, constant stride, non-overlapping & forward. ---
+      //   stride == count is (scalar) already handled and fires before this; here we
+      //   require stride >= count. stride <= 0 rejects scratch reuse (==0) and
+      //   backwards (<0), both fatal to deferral.
+      auto *BufAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(Args.Buffer));
+      if (!BufAR || BufAR->getLoop() != L || !BufAR->isAffine()) return false;
+      if (!SE.isLoopInvariant(BufAR->getStart(), L)) return false;
+      auto *StepC = dyn_cast<SCEVConstant>(BufAR->getStepRecurrence(SE));
+      if (!StepC) return false;
+      const APInt &StepA = StepC->getAPInt();
+      if (StepA.isNonPositive() || StepA.getActiveBits() > 62) return false;
+      uint64_t Stride = StepA.getZExtValue();
+      if (Stride < Count) return false;                    // overlap -> unsafe
 
-  // --- Concrete base pointer for the AA range. ---
-  auto *BaseU = dyn_cast<SCEVUnknown>(BufAR->getStart());
-  if (!BaseU) return false;
-  Value *BasePtr = BaseU->getValue();
-  if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
+      // --- Concrete base pointer for the AA range. ---
+      auto *BaseU = dyn_cast<SCEVUnknown>(BufAR->getStart());
+      if (!BaseU) return false;
+      Value *BasePtr = BaseU->getValue();
+      if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
 
-  // Span actually read by the vectored call: last slot ends at (N-1)*stride+count.
-  if ((N - 1) > (std::numeric_limits<uint64_t>::max() - Count) / Stride)
-    return false;                                      // overflow guard
-  uint64_t Span = (N - 1) * Stride + Count;
+      // Span actually read by the vectored call: last slot ends at (N-1)*stride+count.
+      if ((N - 1) > (std::numeric_limits<uint64_t>::max() - Count) / Stride)
+	return false;                                      // overflow guard
+      uint64_t Span = (N - 1) * Stride + Count;
 
-  // --- pwrite: file offset must be contiguous (step == count). write: nothing. ---
-  const SCEVAddRecExpr *OffAR = nullptr;
-  if (Explicit) {
-    Value *OffV = Call->getArgOperand(3);
-    if (!SE.isSCEVable(OffV->getType())) return false;
-    OffAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
-    if (!OffAR || OffAR->getLoop() != L || !OffAR->isAffine()) return false;
-    if (!SE.isLoopInvariant(OffAR->getStart(), L)) return false;
-    const SCEV *OffStep =
-        SE.getTruncateOrZeroExtend(OffAR->getStepRecurrence(SE), IntPtrTy);
-    const SCEV *CountS =
-        SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), IntPtrTy);
-    if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, OffStep, CountS)) return false;
-  }
-
-  // --- fd/stream loop-invariant. ---
-  if (!L->isLoopInvariant(Args.Target)) return false;
-
-  // --- No-clobber proof: every store touching the span must be an own-slot,
-  //     per-iteration store (matching stride, start-offset in [0,count)), so
-  //     non-overlap guarantees buf_i is stable from iteration i to loop exit.
-  MemoryLocation FullRange(BasePtr, LocationSize::precise(Span));
-  for (BasicBlock *BB : L->blocks()) {
-    for (Instruction &I : *BB) {
-      if (&I == Call) continue;
-      if (!I.mayWriteToMemory()) continue;
-      MemoryAccess *MA = MSSA.getMemoryAccess(&I);
-      if (!MA) return false;
-      if (!isa<MemoryDef>(MA)) continue;
-      if (!isModSet(AA.getModRefInfo(&I, FullRange))) continue;
-      if (!DT.dominates(&I, Call)) return false;
-      Value *WPtr = getMemoryWritePtr(I);
-      if (!WPtr) return false;
-      auto *WAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(WPtr));
-      if (!WAR || WAR->getLoop() != L || !WAR->isAffine()) return false;
-      auto *WStepC = dyn_cast<SCEVConstant>(WAR->getStepRecurrence(SE));
-      if (!WStepC || WStepC->getAPInt() != StepA) return false;
-      auto *Diff = dyn_cast<SCEVConstant>(
-          SE.getMinusSCEV(WAR->getStart(), BufAR->getStart()));
-      if (!Diff) return false;
-      const APInt &DA = Diff->getAPInt();
-      if (DA.isNegative() || DA.getActiveBits() > 62 ||
-          DA.getZExtValue() >= Count)
-        return false;                                  // outside its own slot
-    }
-  }
-
-  // --- No interleaved I/O or opaque side-effecting calls (deferral must not
-  //     cross other observable effects). ---
-  for (BasicBlock *BB : L->blocks()) {
-    for (Instruction &I : *BB) {
-      if (&I == Call) continue;
-      if (auto *CI = dyn_cast<CallInst>(&I)) {
-        if (getIOArguments(CI).Type != IOArgs::NONE) return false;
-        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+      // --- pwrite: file offset must be contiguous (step == count). write: nothing. ---
+      const SCEVAddRecExpr *OffAR = nullptr;
+      if (Explicit) {
+	Value *OffV = Call->getArgOperand(3);
+	if (!SE.isSCEVable(OffV->getType())) return false;
+	OffAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+	if (!OffAR || OffAR->getLoop() != L || !OffAR->isAffine()) return false;
+	if (!SE.isLoopInvariant(OffAR->getStart(), L)) return false;
+	const SCEV *OffStep =
+	  SE.getTruncateOrZeroExtend(OffAR->getStepRecurrence(SE), IntPtrTy);
+	const SCEV *CountS =
+	  SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length), IntPtrTy);
+	if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, OffStep, CountS)) return false;
       }
+
+      // --- fd/stream loop-invariant. ---
+      if (!L->isLoopInvariant(Args.Target)) return false;
+
+      // --- No-clobber proof: every store touching the span must be an own-slot,
+      //     per-iteration store (matching stride, start-offset in [0,count)), so
+      //     non-overlap guarantees buf_i is stable from iteration i to loop exit.
+      MemoryLocation FullRange(BasePtr, LocationSize::precise(Span));
+      for (BasicBlock *BB : L->blocks()) {
+	for (Instruction &I : *BB) {
+	  if (&I == Call) continue;
+	  if (!I.mayWriteToMemory()) continue;
+	  MemoryAccess *MA = MSSA.getMemoryAccess(&I);
+	  if (!MA) return false;
+	  if (!isa<MemoryDef>(MA)) continue;
+	  if (!isModSet(AA.getModRefInfo(&I, FullRange))) continue;
+	  if (!DT.dominates(&I, Call)) return false;
+	  Value *WPtr = getMemoryWritePtr(I);
+	  if (!WPtr) return false;
+	  auto *WAR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(WPtr));
+	  if (!WAR || WAR->getLoop() != L || !WAR->isAffine()) return false;
+	  auto *WStepC = dyn_cast<SCEVConstant>(WAR->getStepRecurrence(SE));
+	  if (!WStepC || WStepC->getAPInt() != StepA) return false;
+	  auto *Diff = dyn_cast<SCEVConstant>(
+					      SE.getMinusSCEV(WAR->getStart(), BufAR->getStart()));
+	  if (!Diff) return false;
+	  const APInt &DA = Diff->getAPInt();
+	  if (DA.isNegative() || DA.getActiveBits() > 62 ||
+	      DA.getZExtValue() >= Count)
+	    return false;                                  // outside its own slot
+	}
+      }
+
+      // --- No interleaved I/O or opaque side-effecting calls (deferral must not
+      //     cross other observable effects). ---
+      for (BasicBlock *BB : L->blocks()) {
+	for (Instruction &I : *BB) {
+	  if (&I == Call) continue;
+	  if (auto *CI = dyn_cast<CallInst>(&I)) {
+	    if (getIOArguments(CI).Type != IOArgs::NONE) return false;
+	    if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+	  }
+	}
+      }
+
+      // ----------------------------- Codegen -----------------------------
+      Type *SizeTy = IntPtrTy;
+      Type *I32 = Type::getInt32Ty(C);
+      PointerType *PtrTy = PointerType::getUnqual(C);
+      StructType *IovecTy = StructType::get(C, {PtrTy, SizeTy}); // {iov_base, iov_len}
+      ArrayType *IovArrTy = ArrayType::get(IovecTy, N);
+
+      SCEVExpander Expander(SE, DL, "io.dvlc.expander");
+
+      // iovec array in the entry block.
+      IRBuilder<> EB(&F->getEntryBlock(), F->getEntryBlock().begin());
+      AllocaInst *Iov = EB.CreateAlloca(IovArrTy, nullptr, "iov.dvlc");
+      Iov->setAlignment(Align(16));
+      Value *Iov0 = EB.CreateInBoundsGEP(IovArrTy, Iov,
+					 {EB.getInt32(0), EB.getInt32(0)}, "iov.first");
+
+      // Parallel pointer-IV phi in the header (preds: Pre, Latch in simplify form).
+      IRBuilder<> HB(Head, Head->begin());
+      PHINode *IovCur = HB.CreatePHI(PtrTy, 2, "iov.cur");
+
+      // Fill this iovec slot at the (soon-erased) call site.
+      IRBuilder<> CB(Call);
+      Value *Buf = Args.Buffer;
+      if (Buf->getType() != PtrTy && Buf->getType()->isPointerTy())
+	Buf = CB.CreatePointerBitCastOrAddrSpaceCast(Buf, PtrTy);
+      CB.CreateStore(Buf, CB.CreateStructGEP(IovecTy, IovCur, 0));
+      CB.CreateStore(ConstantInt::get(SizeTy, Count),
+		     CB.CreateStructGEP(IovecTy, IovCur, 1));
+
+      // Advance the pointer-IV in the latch and complete the phi.
+      IRBuilder<> LB(Latch->getTerminator());
+      Value *IovNext = LB.CreateInBoundsGEP(IovecTy, IovCur, LB.getInt64(1), "iov.next");
+      IovCur->addIncoming(Iov0, Pre);
+      IovCur->addIncoming(IovNext, Latch);
+
+      // Single vectored call in the loop EXIT block (deferred write).
+      IRBuilder<> XB(&*Exit->getFirstInsertionPt());
+      Value *Fd  = XB.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
+      Value *Cnt = ConstantInt::get(I32, (uint64_t)N);
+      if (Explicit) {
+	Type *OffArgTy = Call->getArgOperand(3)->getType();
+	Value *BaseOff =
+	  Expander.expandCodeFor(OffAR->getStart(), OffArgTy, Pre->getTerminator());
+	FunctionCallee PWV = M->getOrInsertFunction(
+						    "pwritev", FunctionType::get(SizeTy, {I32, PtrTy, I32, OffArgTy}, false));
+	XB.CreateCall(PWV, {Fd, Iov0, Cnt, BaseOff});
+      } else {
+	FunctionCallee WV = M->getOrInsertFunction(
+						   "writev", FunctionType::get(SizeTy, {I32, PtrTy, I32}, false));
+	XB.CreateCall(WV, {Fd, Iov0, Cnt});
+      }
+
+      Call->eraseFromParent();                  // unused return -> no RAUW
+      NumLoopsVectorCollapsed++;
+      logMessage("[IOOpt] SUCCESS: DVLC collapsed " + Twine(N) +
+		 (Explicit ? " pwrite" : " write") + " calls into one " +
+		 (Explicit ? "pwritev" : "writev") + ".");
+      return true;
     }
-  }
-
-  // ----------------------------- Codegen -----------------------------
-  Type *SizeTy = IntPtrTy;
-  Type *I32 = Type::getInt32Ty(C);
-  PointerType *PtrTy = PointerType::getUnqual(C);
-  StructType *IovecTy = StructType::get(C, {PtrTy, SizeTy}); // {iov_base, iov_len}
-  ArrayType *IovArrTy = ArrayType::get(IovecTy, N);
-
-  SCEVExpander Expander(SE, DL, "io.dvlc.expander");
-
-  // iovec array in the entry block.
-  IRBuilder<> EB(&F->getEntryBlock(), F->getEntryBlock().begin());
-  AllocaInst *Iov = EB.CreateAlloca(IovArrTy, nullptr, "iov.dvlc");
-  Iov->setAlignment(Align(16));
-  Value *Iov0 = EB.CreateInBoundsGEP(IovArrTy, Iov,
-                    {EB.getInt32(0), EB.getInt32(0)}, "iov.first");
-
-  // Parallel pointer-IV phi in the header (preds: Pre, Latch in simplify form).
-  IRBuilder<> HB(Head, Head->begin());
-  PHINode *IovCur = HB.CreatePHI(PtrTy, 2, "iov.cur");
-
-  // Fill this iovec slot at the (soon-erased) call site.
-  IRBuilder<> CB(Call);
-  Value *Buf = Args.Buffer;
-  if (Buf->getType() != PtrTy && Buf->getType()->isPointerTy())
-    Buf = CB.CreatePointerBitCastOrAddrSpaceCast(Buf, PtrTy);
-  CB.CreateStore(Buf, CB.CreateStructGEP(IovecTy, IovCur, 0));
-  CB.CreateStore(ConstantInt::get(SizeTy, Count),
-                 CB.CreateStructGEP(IovecTy, IovCur, 1));
-
-  // Advance the pointer-IV in the latch and complete the phi.
-  IRBuilder<> LB(Latch->getTerminator());
-  Value *IovNext = LB.CreateInBoundsGEP(IovecTy, IovCur, LB.getInt64(1), "iov.next");
-  IovCur->addIncoming(Iov0, Pre);
-  IovCur->addIncoming(IovNext, Latch);
-
-  // Single vectored call in the loop EXIT block (deferred write).
-  IRBuilder<> XB(&*Exit->getFirstInsertionPt());
-  Value *Fd  = XB.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
-  Value *Cnt = ConstantInt::get(I32, (uint64_t)N);
-  if (Explicit) {
-    Type *OffArgTy = Call->getArgOperand(3)->getType();
-    Value *BaseOff =
-        Expander.expandCodeFor(OffAR->getStart(), OffArgTy, Pre->getTerminator());
-    FunctionCallee PWV = M->getOrInsertFunction(
-        "pwritev", FunctionType::get(SizeTy, {I32, PtrTy, I32, OffArgTy}, false));
-    XB.CreateCall(PWV, {Fd, Iov0, Cnt, BaseOff});
-  } else {
-    FunctionCallee WV = M->getOrInsertFunction(
-        "writev", FunctionType::get(SizeTy, {I32, PtrTy, I32}, false));
-    XB.CreateCall(WV, {Fd, Iov0, Cnt});
-  }
-
-  Call->eraseFromParent();                  // unused return -> no RAUW
-  NumLoopsVectorCollapsed++;
-  logMessage("[IOOpt] SUCCESS: DVLC collapsed " + Twine(N) +
-             (Explicit ? " pwrite" : " write") + " calls into one " +
-             (Explicit ? "pwritev" : "writev") + ".");
-  return true;
-}
 
 
     static bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL,
@@ -1775,14 +1791,14 @@ static bool tryVectoredLoopCollapse(CallInst *Call, const IOArgs &Args, Loop *L,
 
             if (isWrite || isRead) {
               if (!Call->use_empty()) continue;
-if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
-  // Fallback: scattered (stride > count) writes -> writev/pwritev.
-  if (EnableLoopVectored && isWrite &&
-      (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_PWRITE) &&
-      tryVectoredLoopCollapse(Call, Args, L, SE, DL, AA, DT, MSSA))
-    return true;      // loop structure mutated; run() invalidates & refetches
-  continue;
-}
+	      if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
+		// Fallback: scattered (stride > count) writes -> writev/pwritev.
+		if (EnableLoopVectored && isWrite &&
+		    (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_PWRITE) &&
+		    tryVectoredLoopCollapse(Call, Args, L, SE, DL, AA, DT, MSSA))
+		  return true;      // loop structure mutated; run() invalidates & refetches
+		continue;
+	      }
 
 
               bool hasSideEffects = false;
@@ -1859,7 +1875,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
                 Value *OffV = Call->getArgOperand(3);
                 auto *OffAR = cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
                 Value *OffStart =
-                      Expander.expandCodeFor(OffAR->getStart(), OffV->getType(), InsertionPoint);
+		  Expander.expandCodeFor(OffAR->getStart(), OffV->getType(), InsertionPoint);
                 NewArgs = {Args.Target, BasePointer, TotalLenVal, OffStart};   // (fd, buf, len, off)
               } else {
                 NewArgs = {Args.Target, BasePointer, TotalLenVal};
@@ -1868,7 +1884,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
 
               NumLoopsHoisted++;
               logMessage(isRead ? "[IOOpt] SUCCESS: Hoisted DYNAMIC READ to Preheader!"
-                                : "[IOOpt] SUCCESS: Hoisted DYNAMIC WRITE to Exit Block!");
+			 : "[IOOpt] SUCCESS: Hoisted DYNAMIC WRITE to Exit Block!");
 
               Call->eraseFromParent();
               LoopChanged = true;
@@ -2084,7 +2100,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
       const SCEV *BEC = SE.getBackedgeTakenCount(L);
       if (isa<SCEVCouldNotCompute>(BEC)) return false;
       const SCEV *Trips =
-          SE.getAddExpr(SE.getTruncateOrZeroExtend(BEC, IdxTy), SE.getOne(IdxTy));
+	SE.getAddExpr(SE.getTruncateOrZeroExtend(BEC, IdxTy), SE.getOne(IdxTy));
 
       StartOff = SE.getTruncateOrZeroExtend(AR->getStart(), IdxTy);
       TotalLen = SE.getMulExpr(CountS, Trips);
@@ -2134,7 +2150,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
 
           IRBuilder<> B(IP);
           FunctionCallee Fadvise = M->getOrInsertFunction(
-              "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
+							  "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
           Value *Fd = B.CreateIntCast(Args.Target, I32, /*isSigned=*/true);
           // POSIX_FADV_WILLNEED == 3 on mainstream Linux/glibc (see caveat).
           B.CreateCall(Fadvise, {Fd, OffVal, B.getInt64(Bytes), B.getInt32(3)});
@@ -2217,7 +2233,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
       if (Args.Type == IOArgs::C_FREAD) {
         Type *PtrTy = B.getPtrTy();
         FunctionCallee Fileno =
-            M->getOrInsertFunction("fileno", FunctionType::get(I32, {PtrTy}, false));
+	  M->getOrInsertFunction("fileno", FunctionType::get(I32, {PtrTy}, false));
         Value *Fp = Args.Target;
         if (Fp->getType() != PtrTy && Fp->getType()->isPointerTy())
           Fp = B.CreatePointerBitCastOrAddrSpaceCast(Fp, PtrTy);
@@ -2267,7 +2283,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
       if (StepVal <= Len) return Access::Sequential;       // contiguous/overlapping
       uint64_t Gap = StepVal - Len;
       return (Gap >= Config.PrefetchRandomGapBytes) ? Access::Random
-                                                    : Access::Sequential;
+	: Access::Sequential;
     }
 
     static bool runOnLoop(Loop *L, ScalarEvolution &SE) {
@@ -2329,7 +2345,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
           if (!Fd) { HintedFDs.erase(FdK); continue; }
 
           FunctionCallee Fadvise = M->getOrInsertFunction(
-              "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
+							  "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
           // Mode hint over the whole file: offset=0, len=0.
           B.CreateCall(Fadvise, {Fd, B.getInt64(0), B.getInt64(0),
                                  B.getInt32(Advice)});
@@ -2498,8 +2514,8 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
 
       IRBuilder<> B(R);
       FunctionCallee CFR = M->getOrInsertFunction(
-          "copy_file_range",
-          FunctionType::get(SizeTy, {I32, PtrTy, I32, PtrTy, SizeTy, I32}, false));
+						  "copy_file_range",
+						  FunctionType::get(SizeTy, {I32, PtrTy, I32, PtrTy, SizeTy, I32}, false));
 
       Value *SrcI = B.CreateIntCast(SrcFd, I32, /*isSigned=*/true);
       Value *DstI = B.CreateIntCast(DstFd, I32, /*isSigned=*/true);
@@ -2522,7 +2538,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
       }
 
       CallInst *Rc = B.CreateCall(
-          CFR, {SrcI, OffInArg, DstI, OffOutArg, LenS, B.getInt32(0)}, "cfr.ret");
+				  CFR, {SrcI, OffInArg, DstI, OffOutArg, LenS, B.getInt32(0)}, "cfr.ret");
 
       // ---- No-fallback mode: trust copy_file_range (documented caveat). ----
       if (!EnableCFRFallback) {
@@ -2543,7 +2559,7 @@ if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
       // hard-coded POSIX_FADV_* values elsewhere in this plugin).
       Value *IsErr = B.CreateICmpSLT(Rc, ConstantInt::get(SizeTy, 0), "cfr.err");
       FunctionCallee ErrLoc = M->getOrInsertFunction(
-          "__errno_location", FunctionType::get(PtrTy, {}, false));
+						     "__errno_location", FunctionType::get(PtrTy, {}, false));
       Value *EP  = B.CreateCall(ErrLoc, {}, "cfr.errloc");
       Value *Err = B.CreateLoad(I32, EP, "cfr.errno");
       Value *Nosys = B.CreateICmpEQ(Err, ConstantInt::get(I32, 38));
@@ -2671,51 +2687,51 @@ llvmGetPassPluginInfo() {
 
       // opt -passes=io-opt  (function-level)
       PB.registerPipelineParsingCallback(
-        [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "io-opt") {
-            FPM.addPass(IOLoopHoistingPass());
-            FPM.addPass(IOCopyFileRangePass());
-            FPM.addPass(IOBatchingPass());
-            FPM.addPass(IOPrefetchPass());
-            FPM.addPass(IOSequentialPrefetchPass());
-            return true;
-          }
-          return false;
-        });
+					 [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
+					   if (Name == "io-opt") {
+					     FPM.addPass(IOLoopHoistingPass());
+					     FPM.addPass(IOCopyFileRangePass());
+					     FPM.addPass(IOBatchingPass());
+					     FPM.addPass(IOPrefetchPass());
+					     FPM.addPass(IOSequentialPrefetchPass());
+					     return true;
+					   }
+					   return false;
+					 });
 
       // opt -passes=io-lto-merge  (module-level)
       PB.registerPipelineParsingCallback(
-        [addFunctionPipeline](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "io-lto-merge") {
-            // Explicitly requested by the user: always run the interprocedural
-            // wrapper-inlining step (its whole reason for existing). EnableEarlyIPO
-            // only governs *implicit* injection at pipeline start.
-            MPM.addPass(InterProceduralIOBatchingPass());
-            addFunctionPipeline(MPM);
-            return true;
-          }
-          return false;
-        });
+					 [addFunctionPipeline](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+					   if (Name == "io-lto-merge") {
+					     // Explicitly requested by the user: always run the interprocedural
+					     // wrapper-inlining step (its whole reason for existing). EnableEarlyIPO
+					     // only governs *implicit* injection at pipeline start.
+					     MPM.addPass(InterProceduralIOBatchingPass());
+					     addFunctionPipeline(MPM);
+					     return true;
+					   }
+					   return false;
+					 });
 
       // Early IPO wrapper inlining is opt-in for *implicit* injection 
       PB.registerPipelineStartEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level) {
-          if (EnableEarlyIPO)
-            MPM.addPass(InterProceduralIOBatchingPass());
-        });
+					 [](ModulePassManager &MPM, OptimizationLevel Level) {
+					   if (EnableEarlyIPO)
+					     MPM.addPass(InterProceduralIOBatchingPass());
+					 });
 
       PB.registerOptimizerLastEPCallback(
-        [addFunctionPipeline](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-          addFunctionPipeline(MPM);
-        });
+					 [addFunctionPipeline](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+					   addFunctionPipeline(MPM);
+					 });
 
       // Standard Clang LTO (-flto): preserve the original behaviour of always
       // running the interprocedural inliner so cross-file wrappers are caught.
       PB.registerFullLinkTimeOptimizationLastEPCallback(
-        [addFunctionPipeline](ModulePassManager &MPM, OptimizationLevel Level) {
-          MPM.addPass(InterProceduralIOBatchingPass());
-          addFunctionPipeline(MPM);
-        });
+							[addFunctionPipeline](ModulePassManager &MPM, OptimizationLevel Level) {
+							  MPM.addPass(InterProceduralIOBatchingPass());
+							  addFunctionPipeline(MPM);
+							});
     }};
 }
 
