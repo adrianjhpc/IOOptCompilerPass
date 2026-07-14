@@ -1,12 +1,14 @@
-// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s --check-prefix=PREFETCH
-// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -io-opt-prefetch=false -io-opt-prefetch-sequential=false -S | %FileCheck %s --check-prefix=NOPREFETCH
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -io-opt-prefetch -S | %FileCheck %s --check-prefix=PREFETCH
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s --check-prefix=NOPREFETCH
+
 #include <unistd.h>
 
 extern "C" {
 
 // 32 sequential 4096-byte preads = 131072 bytes, above the 64KiB threshold.
 // pread loops are handled by neither hoisting nor batching, so this is the
-// canonical prefetch target: one WILLNEED for the whole range in the preheader.
+// canonical WILLNEED target: one hint for the whole range in the preheader.
+// Prefetch is opt-in: PREFETCH requires -io-opt-prefetch; default is negative.
 
 // PREFETCH-LABEL: define {{.*}}@prefetch_loop
 // NOPREFETCH-LABEL: define {{.*}}@prefetch_loop

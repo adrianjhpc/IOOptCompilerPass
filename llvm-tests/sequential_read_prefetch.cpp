@@ -1,5 +1,5 @@
-// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s --check-prefix=SEQ
-// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -io-opt-prefetch-sequential=false -S | %FileCheck %s --check-prefix=NOSEQ
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -io-opt-prefetch -S | %FileCheck %s --check-prefix=SEQ
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s --check-prefix=NOSEQ
 
 #include <unistd.h>
 
@@ -8,6 +8,8 @@ extern "C" {
 // A read() loop into a FIXED buffer: the file offset advances implicitly, so
 // it's sequential, but the buffer is not an addrec -> NOT hoistable and NOT a
 // WILLNEED target (implicit offset). This is exactly what SEQUENTIAL covers.
+// Prefetch is now opt-in, so SEQ requires -io-opt-prefetch; the default (no
+// flag) is the negative case.
 
 // SEQ-LABEL: define {{.*}}@seq_read_loop
 // NOSEQ-LABEL: define {{.*}}@seq_read_loop

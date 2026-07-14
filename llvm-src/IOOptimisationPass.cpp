@@ -68,11 +68,7 @@ STATISTIC(NumFunctionsAnalyzed, "Number of functions analyzed by IOOpt");
 STATISTIC(NumBatchesRejectedUnsafeUse, "Number of batches skipped because a used return was needed pre-merge");
 STATISTIC(NumPrefetchHints, "Number of posix_fadvise(WILLNEED) prefetch hints inserted");
 STATISTIC(NumSeqHints, "Number of posix_fadvise(SEQUENTIAL) hints inserted");
-
-static cl::opt<bool> EnableSeqPrefetch(
-    "io-opt-prefetch-sequential", cl::init(true), cl::Hidden,
-    cl::desc("Insert posix_fadvise(SEQUENTIAL) for loops with monotonic "
-             "sequential reads (covers read()/fread that WILLNEED cannot)."));
+STATISTIC(NumRandomHints, "Number of posix_fadvise(RANDOM) hints inserted");
 
 // --- Master enable + gating flags (Don't transform aggressively just
 // because the plugin is loaded). ---
@@ -96,10 +92,30 @@ static cl::opt<bool> AssumeRegularFiles(
              "datagram/seqpacket sockets may be batched (atomicity/message "
              "boundaries would otherwise change)."));
 
+// Master opt-in for the whole prefetch family. Now OFF by default.
+// Rationale: on random-access workloads (databases, chunked HDF5) a SEQUENTIAL
+// hint widens kernel readahead and pollutes the page cache -- we observed this
+// as a probable read regression. Prefetch is only a win for genuinely
+// streaming access, so it must be requested deliberately.
 static cl::opt<bool> EnablePrefetch(
-    "io-opt-prefetch", cl::init(true), cl::Hidden,
-    cl::desc("Insert posix_fadvise(WILLNEED) hints for analyzable, un-merged "
-             "sequential pread loop ranges."));
+    "io-opt-prefetch", cl::init(false), cl::Hidden,
+    cl::desc("Master opt-in for ALL IOOpt prefetch hints "
+             "(WILLNEED/SEQUENTIAL/RANDOM). Off by default."));
+
+// Sub-switches (only meaningful when -io-opt-prefetch is set).
+static cl::opt<bool> EnableWillNeed(
+    "io-opt-prefetch-willneed", cl::init(true), cl::Hidden,
+    cl::desc("(Requires -io-opt-prefetch) WILLNEED for analyzable pread ranges."));
+
+static cl::opt<bool> EnableSeqPrefetch(
+    "io-opt-prefetch-sequential", cl::init(true), cl::Hidden,
+    cl::desc("(Requires -io-opt-prefetch) SEQUENTIAL for monotonic contiguous "
+             "read loops."));
+
+static cl::opt<bool> EnableRandomPrefetch(
+    "io-opt-prefetch-random", cl::init(true), cl::Hidden,
+    cl::desc("(Requires -io-opt-prefetch) RANDOM to SUPPRESS readahead on "
+             "large-strided or non-affine pread loops."));
 
 static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
   const char *Val = std::getenv(Name);
@@ -124,6 +140,7 @@ struct IOConfig {
   unsigned MaxIov;
   unsigned PrefetchMinBytes;
   unsigned PrefetchMaxBytes;
+  unsigned PrefetchRandomGapBytes;   // gap beyond which strided access is "random"
   bool EnableLogging;
 
   IOConfig() {
@@ -133,6 +150,7 @@ struct IOConfig {
     MaxIov           = getEnvOrDefaultU("IO_MAX_IOV", 1024);
     PrefetchMinBytes = getEnvOrDefaultU("IO_PREFETCH_MIN_BYTES", 65536);
     PrefetchMaxBytes = getEnvOrDefaultU("IO_PREFETCH_MAX_BYTES", 128u * 1024 * 1024);
+    PrefetchRandomGapBytes = getEnvOrDefaultU("IO_PREFETCH_RANDOM_GAP", 4096);
     EnableLogging    = getEnvOrDefaultU("IO_ENABLE_LOGGING", 0) != 0;
   }
 };
@@ -194,7 +212,7 @@ namespace {
       NONE, C_FWRITE, C_FREAD, POSIX_WRITE, POSIX_READ, POSIX_PWRITE, POSIX_PREAD,
       CXX_WRITE, CXX_READ, MPI_WRITE_AT, MPI_READ_AT,
       SPLICE, SENDFILE, POSIX_PWRITEV, POSIX_PREADV, IO_SUBMIT, AIO_WRITE,
-      C_FPUTC
+      C_FPUTC, C_FPUTS, C_PUTS
     } Type;
     Value *ScalarData = nullptr;    // the int char value for C_FPUTC
   };
@@ -275,7 +293,6 @@ namespace {
       Value *Bytes = getCStreamBytes(Call);
       return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : NONE;
     }
-
     // Functionality to capture fputc or putc calls
     // int fputc(int c, FILE *stream); int putc(int c, FILE *stream);
     if (isSymbolName(Name, "fputc") || isSymbolName(Name, "putc") ||
@@ -287,8 +304,25 @@ namespace {
       A.ScalarData = Call->getArgOperand(0);   // the char (as int)
       return A;
     }
-
-
+    // Functionality to capture fputs or puts calls
+    // int fputs(const char *s, FILE *stream);
+    if (isSymbolName(Name, "fputs")) {
+      if (!need(2) || !isPtr(0) || !isPtr(1)) return NONE;
+      // Length = strlen(s), materialized at emission (can't insert IR here).
+      return {Call->getArgOperand(1), Call->getArgOperand(0), /*Length=*/nullptr,
+              IOArgs::C_FPUTS};
+    }
+    // int puts(const char *s);  -> writes s + '\n' to stdout.
+    if (isSymbolName(Name, "puts")) {
+      if (!need(1) || !isPtr(0)) return NONE;
+      // No stream operand and stdout may not be a module symbol, so we use the
+      // puts callee itself as the stream-identity key (all puts share it). The
+      // real stream is resolved to @stdout at emission. Correctness of ordering
+      // does NOT rely on this key: the hazard scan in isSafeToAddToBatch treats
+      // every intervening I/O/opaque call (incl. fflush) as a batch-breaker.
+      return {/*Target=*/F, Call->getArgOperand(0), /*Length=*/nullptr,
+              IOArgs::C_PUTS};
+    }
     if (isSymbolName(Name, "preadv") || isSymbolName(Name, "preadv2")) {
       if (!need(3) || !isPtr(1)) return NONE;
       return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREADV};
@@ -706,7 +740,7 @@ namespace {
           }
         }
 
-        if (FirstArgs.Target->getType()->isPointerTy()) {
+        if (FirstArgs.Target->getType()->isPointerTy() && !isa<Function>(FirstArgs.Target)) {
           MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
           if (isModSet(AA.getModRefInfo(Inst, TargetLoc))) return true;
         }
@@ -786,7 +820,8 @@ namespace {
 
     bool isWriteBatch = (FirstArgs.Type == IOArgs::POSIX_WRITE || FirstArgs.Type == IOArgs::POSIX_PWRITE ||
                          FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::C_FWRITE ||
-                         FirstArgs.Type == IOArgs::CXX_WRITE);
+                         FirstArgs.Type == IOArgs::CXX_WRITE || FirstArgs.Type == IOArgs::C_FPUTS ||
+                         FirstArgs.Type == IOArgs::C_PUTS);
 
     if (isWriteBatch) {
       bool isConstantTinySize = true;
@@ -946,6 +981,7 @@ namespace {
     if (Batch.empty() || PB.Pattern == IOPattern::Unprofitable) return false;
 
     const DataLayout &DL = M->getDataLayout();
+    Type *SizeTy = DL.getIntPtrType(M->getContext());
     const uint64_t TotalConstSize = PB.TotalRange;
     const IOPattern Pattern = PB.Pattern;
 
@@ -960,11 +996,32 @@ namespace {
     Instruction *InsertPt = isRead ? Batch.front() : Batch.back();
     IRBuilder<> InsertBuilder(InsertPt);
 
-    Value *TotalDynLen = InsertBuilder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), 0);
-    for (CallInst *C : Batch) {
-      Value *L = getIOArguments(C).Length;
-      if (L && L->getType() != TotalDynLen->getType()) L = InsertBuilder.CreateZExtOrTrunc(L, TotalDynLen->getType());
-      if (L) TotalDynLen = InsertBuilder.CreateAdd(TotalDynLen, L, "dyn.len.add");
+    // Per-call "core" payload length (excludes synthetic newline) + newline flag.
+    Type *LenTy = FirstArgs.Length ? FirstArgs.Length->getType() : SizeTy;
+    FunctionCallee StrlenFn;
+    SmallVector<Value*, 8> CoreLen(Batch.size(), nullptr);
+    SmallVector<bool, 8>   AppendNL(Batch.size(), false);
+    for (size_t i = 0; i < Batch.size(); ++i) {
+      IOArgs A = getIOArguments(Batch[i]);
+      AppendNL[i] = (A.Type == IOArgs::C_PUTS);
+      if (A.Length) { CoreLen[i] = A.Length; continue; }
+      // fputs/puts: strlen(s), inserted before the call (each earlier call
+      // dominates Batch.back(), so this dominates the merge/insert point).
+      if (!StrlenFn)
+        StrlenFn = M->getOrInsertFunction(
+            "strlen", FunctionType::get(SizeTy, {InsertBuilder.getPtrTy()}, false));
+      IRBuilder<> SB(Batch[i]);
+      Value *S = A.Buffer;
+      if (S->getType() != SB.getPtrTy() && S->getType()->isPointerTy())
+        S = SB.CreatePointerBitCastOrAddrSpaceCast(S, SB.getPtrTy());
+      CoreLen[i] = SB.CreateCall(StrlenFn, {S}, "ioopt.slen");
+    }
+
+    Value *TotalDynLen = ConstantInt::get(LenTy, 0);
+    for (size_t i = 0; i < Batch.size(); ++i) {
+      Value *L = InsertBuilder.CreateZExtOrTrunc(CoreLen[i], LenTy);
+      if (AppendNL[i]) L = InsertBuilder.CreateAdd(L, ConstantInt::get(LenTy, 1));
+      TotalDynLen = InsertBuilder.CreateAdd(TotalDynLen, L, "dyn.len.add");
     }
 
     CallInst *MergedCall = nullptr;
@@ -1061,7 +1118,6 @@ namespace {
     }
 
     case IOPattern::DynamicShadowBuffer: {
-      Type *SizeTy = DL.getIntPtrType(M->getContext());
       Type *Int8Ty = InsertBuilder.getInt8Ty();
       PointerType *PtrTy = InsertBuilder.getPtrTy();
       Type *Int32Ty = InsertBuilder.getInt32Ty();
@@ -1128,17 +1184,41 @@ namespace {
 
       Value *CurrentOffset = ConstantInt::get(SizeTy, 0);
       for (size_t i = 0; i < Batch.size(); ++i) {
-        CallInst *C = Batch[i];
-        IOArgs Args = getIOArguments(C);
-
-        Value *Len = ContBuilder.CreateZExtOrTrunc(Args.Length, SizeTy);
+        IOArgs Args = getIOArguments(Batch[i]);
+        Value *Core = ContBuilder.CreateZExtOrTrunc(CoreLen[i], SizeTy);
         Value *DestPtr = ContBuilder.CreateInBoundsGEP(Int8Ty, HeapBuf, CurrentOffset, "dyn.dest");
-
-        ContBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
-        CurrentOffset = ContBuilder.CreateAdd(CurrentOffset, Len, "dyn.offset");
+        ContBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Core);
+        Value *End = ContBuilder.CreateAdd(CurrentOffset, Core);
+        if (AppendNL[i]) {   // puts: append '\n'
+          Value *NlDest = ContBuilder.CreateInBoundsGEP(Int8Ty, HeapBuf, End, "dyn.nl");
+          ContBuilder.CreateStore(ContBuilder.getInt8('\n'), NlDest);
+          End = ContBuilder.CreateAdd(End, ConstantInt::get(SizeTy, 1));
+        }
+        CurrentOffset = End;
       }
 
-      MergedCall = ContBuilder.CreateCall(Batch[0]->getCalledFunction(), buildArgs(HeapBuf));
+      // fputs/puts merge into fwrite (not their original callee); resolve stdout.
+      if (FirstArgs.Type == IOArgs::C_FPUTS || FirstArgs.Type == IOArgs::C_PUTS) {
+        PointerType *PtrTy = ContBuilder.getPtrTy();
+        Value *Stream;
+        if (FirstArgs.Type == IOArgs::C_PUTS) {
+          GlobalVariable *StdoutG =
+              cast<GlobalVariable>(M->getOrInsertGlobal("stdout", PtrTy));
+          Stream = ContBuilder.CreateLoad(PtrTy, StdoutG, "ioopt.stdout");
+        } else {
+          Stream = FirstArgs.Target;
+          if (Stream->getType() != PtrTy && Stream->getType()->isPointerTy())
+            Stream = ContBuilder.CreatePointerBitCastOrAddrSpaceCast(Stream, PtrTy);
+        }
+        FunctionCallee Fwrite = M->getOrInsertFunction(
+            "fwrite", FunctionType::get(SizeTy, {PtrTy, SizeTy, SizeTy, PtrTy}, false));
+        Value *Count = ContBuilder.CreateZExtOrTrunc(TotalDynLen, SizeTy);
+        MergedCall = ContBuilder.CreateCall(
+            Fwrite, {HeapBuf, ConstantInt::get(SizeTy, 1), Count, Stream});
+      } else {
+        MergedCall = ContBuilder.CreateCall(Batch[0]->getCalledFunction(), buildArgs(HeapBuf));
+      }
+
       ContBuilder.CreateCall(FreeFunc, {HeapBuf});
 
       NumBatchesMerged++;
@@ -1261,14 +1341,16 @@ namespace {
       CallInst *C = Batch[i];
       IOArgs CArgs = getIOArguments(C);
 
-      Value *ByteLen = (RetIsInt && CArgs.Length)
-          ? RetBuilder.CreateIntCast(CArgs.Length, RetTy, /*isSigned=*/false)
-          : nullptr;
+      // Contrib = core payload + newline, in RetTy.
+      Value *Contrib = nullptr;
+      if (RetIsInt) {
+        Contrib = RetBuilder.CreateIntCast(CoreLen[i], RetTy, /*isSigned=*/false);
+        if (AppendNL[i]) Contrib = RetBuilder.CreateAdd(Contrib, ConstantInt::get(RetTy, 1));
+      }
 
       if (C->use_empty()) {
-        if (ByteLen) Prefix = RetBuilder.CreateAdd(Prefix, ByteLen);
-        ToErase.push_back(C);
-        continue;
+        if (Contrib) Prefix = RetBuilder.CreateAdd(Prefix, Contrib);
+        ToErase.push_back(C); continue;
       }
 
       Value *Rep = nullptr;
@@ -1287,13 +1369,21 @@ namespace {
             ConstantInt::get(C->getType(), 0xFF));
         Rep = RetBuilder.CreateSelect(
             Wrote, CharI, ConstantInt::get(C->getType(), (uint64_t)-1), "io.fputc.ret");
-      } else if (RetIsInt && ByteLen) {
-        // clamp(R - Prefix, 0, ByteLen)
+      } else if (CArgs.Type == IOArgs::C_FPUTS || CArgs.Type == IOArgs::C_PUTS) {
+        // fwrite (elem size 1) returns bytes written. This call fully succeeded
+        // iff R reached the end of its slice. fputs/puts: >=0 on success, EOF on error.
+        Value *End = RetBuilder.CreateAdd(Prefix, Contrib);
+        Value *Ok  = RetBuilder.CreateICmpUGE(R, End, "io.fputs.ok");
+        Rep = RetBuilder.CreateSelect(Ok, ConstantInt::get(RetTy, 0),
+                 ConstantInt::get(RetTy, (uint64_t)-1), "io.fputs.ret");
+        if (C->getType() != Rep->getType())
+          Rep = RetBuilder.CreateIntCast(Rep, C->getType(), true);
+      } else if (RetIsInt && Contrib) {
         Value *Avail  = RetBuilder.CreateSub(R, Prefix, "io.avail");
         Value *NegLo  = RetBuilder.CreateICmpSLT(Avail, ConstantInt::get(RetTy, 0));
         Value *Lo     = RetBuilder.CreateSelect(NegLo, ConstantInt::get(RetTy, 0), Avail);
-        Value *OverHi = RetBuilder.CreateICmpSGT(Lo, ByteLen);
-        Value *Bytes  = RetBuilder.CreateSelect(OverHi, ByteLen, Lo, "io.bytes");
+        Value *OverHi = RetBuilder.CreateICmpSGT(Lo, Contrib);
+        Value *Bytes  = RetBuilder.CreateSelect(OverHi, Contrib, Lo, "io.bytes");
 
         if (CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::C_FREAD) {
           // fread/fwrite return element COUNT, and never go negative.
@@ -1315,7 +1405,7 @@ namespace {
           Rep = RetBuilder.CreateIntCast(Rep, C->getType(), true);
       }
 
-      if (ByteLen) Prefix = RetBuilder.CreateAdd(Prefix, ByteLen);
+      if (Contrib) Prefix = RetBuilder.CreateAdd(Prefix, Contrib);
       C->replaceAllUsesWith(Rep);   // RAUW does not move/erase C -> anchor safe
       ToErase.push_back(C);
     }
@@ -1650,7 +1740,8 @@ namespace {
                           CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE ||
                           CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::SPLICE ||
                           CArgs.Type == IOArgs::SENDFILE || CArgs.Type == IOArgs::IO_SUBMIT ||
-                          CArgs.Type == IOArgs::AIO_WRITE || CArgs.Type == IOArgs::C_FPUTC);
+                          CArgs.Type == IOArgs::AIO_WRITE || CArgs.Type == IOArgs::C_FPUTC ||
+                          CArgs.Type == IOArgs::C_FPUTS || CArgs.Type == IOArgs::C_PUTS);
 
           bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD || CArgs.Type == IOArgs::POSIX_PREAD || CArgs.Type == IOArgs::MPI_READ_AT || CArgs.Type == IOArgs::CXX_READ);
 
@@ -1808,7 +1899,7 @@ namespace {
     }
  
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-      if (!EnableIOOpt || !EnablePrefetch) return PreservedAnalyses::all();
+      if (!EnableIOOpt || !EnablePrefetch || !EnableWillNeed) return PreservedAnalyses::all();
       // Advisory, but only worth a syscall on seekable/regular files.
       if (!AssumeRegularFiles) return PreservedAnalyses::all();
 
@@ -1826,6 +1917,8 @@ namespace {
  
 
   struct IOSequentialPrefetchPass : public PassInfoMixin<IOSequentialPrefetchPass> {
+
+    enum class Access { Unknown, Sequential, Random };
 
     // fd identity: see through a load-from-slot so a stored/reloaded fd compares
     // equal (mirrors IOBatchingPass::fdKey).
@@ -1891,12 +1984,46 @@ namespace {
               CI->setMetadata("io.seq.hinted", Tag);
     }
 
+    // Classify a pread's per-iteration offset addrec.
+    //   step == len            -> Sequential (contiguous; readahead helps)
+    //   0 < gap < GapThreshold -> Sequential (small holes; readahead still helps)
+    //   gap >= GapThreshold    -> Random     (big holes; readahead is wasted)
+    //   non-affine / non-const step / negative step -> Random (unpredictable)
+    static Access classifyPread(CallInst *Call, const IOArgs &Args, Loop *L,
+                                ScalarEvolution &SE) {
+      Value *OffV = Call->getArgOperand(3);
+      if (!SE.isSCEVable(OffV->getType())) return Access::Unknown;
+
+      auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(OffV));
+      if (!AR || AR->getLoop() != L) return Access::Unknown;
+      if (!AR->isAffine()) return Access::Random;          // unpredictable stride
+
+      auto *StepC = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+      if (!StepC) return Access::Random;                   // non-constant stride
+      const APInt &Step = StepC->getAPInt();
+      if (Step.isNegative()) return Access::Random;        // backwards defeats RA
+      uint64_t StepVal = Step.getZExtValue();
+
+      // Need the read length to compare against the stride.
+      uint64_t Len = 0;
+      if (auto *LC = dyn_cast_or_null<ConstantInt>(Args.Length))
+        Len = LC->getZExtValue();
+      else if (SE.isSCEVable(Args.Length->getType()))
+        if (auto *LS = dyn_cast<SCEVConstant>(SE.getSCEV(Args.Length)))
+          Len = LS->getAPInt().getZExtValue();
+      if (Len == 0) return Access::Unknown;                // can't judge the gap
+
+      if (StepVal <= Len) return Access::Sequential;       // contiguous/overlapping
+      uint64_t Gap = StepVal - Len;
+      return (Gap >= Config.PrefetchRandomGapBytes) ? Access::Random
+                                                    : Access::Sequential;
+    }
+
     static bool runOnLoop(Loop *L, ScalarEvolution &SE) {
       if (!L->isLoopSimplifyForm()) return false;
       BasicBlock *Preheader = L->getLoopPreheader();
       if (!Preheader) return false;
 
-      // Skip trivially short loops (SEQUENTIAL is cheap, but not worth it for 1-2 iters).
       const SCEV *BEC = SE.getBackedgeTakenCount(L);
       if (auto *C = dyn_cast<SCEVConstant>(BEC))
         if (C->getAPInt().getZExtValue() + 1 < 4) return false;
@@ -1918,26 +2045,32 @@ namespace {
           bool ImplicitRead = (Args.Type == IOArgs::POSIX_READ ||
                                Args.Type == IOArgs::C_FREAD);
           bool ExplicitRead = (Args.Type == IOArgs::POSIX_PREAD);
-          // CXX_READ deliberately excluded: no portable fd.
           if (!ImplicitRead && !ExplicitRead) continue;
-
-          // Don't double up with the WILLNEED pass on the same pread.
           if (ExplicitRead && Call->getMetadata("io.prefetched")) continue;
-
           if (!Args.Target || !L->isLoopInvariant(Args.Target)) continue;
 
-          // Sequentiality:
-          //  - implicit-offset reads advance the file position themselves, so a
-          //    loop of them is sequential unless a seek perturbs the offset.
-          //  - pread carries its offset -> require a monotonic addrec; seeks OK.
+          // Decide the advice for this read.
+          //  - pread: classify by offset addrec (Sequential vs Random).
+          //  - read/fread: implicitly sequential unless a seek perturbs it.
+          int Advice;                 // Linux: RANDOM=1, SEQUENTIAL=2
+          const char *Kind;
           if (ExplicitRead) {
-            if (!preadOffsetIsSequential(Call, L, SE)) continue;
-          } else if (SeekPresent) {
-            continue;
+            switch (classifyPread(Call, Args, L, SE)) {
+            case Access::Sequential:
+              if (!EnableSeqPrefetch) continue;
+              Advice = 2; Kind = "SEQUENTIAL"; break;
+            case Access::Random:
+              if (!EnableRandomPrefetch) continue;
+              Advice = 1; Kind = "RANDOM"; break;
+            default: /* Unknown */ continue;
+            }
+          } else {
+            if (!EnableSeqPrefetch || SeekPresent) continue;
+            Advice = 2; Kind = "SEQUENTIAL";
           }
 
           Value *FdK = fdKey(Args.Target);
-          if (!FdK || !HintedFDs.insert(FdK).second) continue; // dedup within run
+          if (!FdK || !HintedFDs.insert(FdK).second) continue;
 
           Instruction *IP = Preheader->getTerminator();
           IRBuilder<> B(IP);
@@ -1946,20 +2079,26 @@ namespace {
 
           FunctionCallee Fadvise = M->getOrInsertFunction(
               "posix_fadvise", FunctionType::get(I32, {I32, I64, I64, I32}, false));
-          // offset=0,len=0 => whole file; SEQUENTIAL == 2 on mainstream Linux.
-          B.CreateCall(Fadvise, {Fd, B.getInt64(0), B.getInt64(0), B.getInt32(2)});
-          markReadsOnFd(L, FdK, C); // idempotent across re-runs
-          NumSeqHints++;
+          // Mode hint over the whole file: offset=0, len=0.
+          B.CreateCall(Fadvise, {Fd, B.getInt64(0), B.getInt64(0),
+                                 B.getInt32(Advice)});
+          markReadsOnFd(L, FdK, C);
+          if (Advice == 1) NumRandomHints++; else NumSeqHints++;
           Changed = true;
-          logMessage("[IOOpt] Prefetch: posix_fadvise(SEQUENTIAL) inserted for a "
-                     "sequential read loop.");
+          logMessage(Twine("[IOOpt] Prefetch: posix_fadvise(") + Kind +
+                     ") inserted for a " +
+                     (Advice == 1 ? "large-strided/random" : "sequential") +
+                     " read loop.");
         }
       }
       return Changed;
     }
 
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-      if (!EnableIOOpt || !EnableSeqPrefetch) return PreservedAnalyses::all();
+      // Master opt-in gates the whole pass; sub-switches select advice kind.
+      if (!EnableIOOpt || !EnablePrefetch) return PreservedAnalyses::all();
+      if (!EnableSeqPrefetch && !EnableRandomPrefetch)
+        return PreservedAnalyses::all();
       if (!AssumeRegularFiles) return PreservedAnalyses::all();
 
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
