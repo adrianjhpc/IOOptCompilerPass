@@ -7,6 +7,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -24,6 +25,7 @@
 #include "llvm/Transforms/Utils/LCSSA.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopVersioning.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
@@ -69,6 +71,7 @@ STATISTIC(NumBatchesRejectedUnsafeUse, "Number of batches skipped because a used
 STATISTIC(NumPrefetchHints, "Number of posix_fadvise(WILLNEED) prefetch hints inserted");
 STATISTIC(NumSeqHints, "Number of posix_fadvise(SEQUENTIAL) hints inserted");
 STATISTIC(NumRandomHints, "Number of posix_fadvise(RANDOM) hints inserted");
+STATISTIC(NumCopyFileRange, "Number of read+write bounce buffers promoted to copy_file_range");
 
 // --- Master enable + gating flags (Don't transform aggressively just
 // because the plugin is loaded). ---
@@ -116,6 +119,32 @@ static cl::opt<bool> EnableRandomPrefetch(
     "io-opt-prefetch-random", cl::init(true), cl::Hidden,
     cl::desc("(Requires -io-opt-prefetch) RANDOM to SUPPRESS readahead on "
              "large-strided or non-affine pread loops."));
+
+// --- copy_file_range promotion (read+write / pread+pwrite bounce buffer -> one
+// in-kernel copy). OFF by default: it changes the syscall surface and has real
+// EXDEV/ENOSYS edge cases (see fallback below). ---
+static cl::opt<bool> EnableCopyFileRange(
+    "io-opt-copy-file-range", cl::init(false), cl::Hidden,
+    cl::desc("Promote read+write / pread+pwrite bounce-buffer copies into a "
+             "single copy_file_range (opt-in)."));
+
+// Emit a runtime fallback that re-runs the original read/write when
+// copy_file_range fails with ENOSYS (old kernel) or EXDEV (cross-filesystem).
+// Strongly recommended: without it, enabling promotion can turn a working
+// cross-mount copy into a hard failure. Both errnos occur *before* any bytes are
+// copied, so the fallback re-read/-write starts from an unperturbed position.
+static cl::opt<bool> EnableCFRFallback(
+    "io-opt-cfr-fallback", cl::init(true), cl::Hidden,
+    cl::desc("Guard copy_file_range with a read/write fallback on ENOSYS/EXDEV "
+             "(preserves old-kernel / cross-filesystem correctness)."));
+
+// Also match copies whose write length is a *constant equal to the read count*
+// (i.e. code that ignores the read return and assumes a full read). This changes
+// behaviour on the short-read/EOF edge, so it is a deliberate, separate opt-in.
+static cl::opt<bool> CFRAssumeFullReads(
+    "io-opt-cfr-assume-full-reads", cl::init(false), cl::Hidden,
+    cl::desc("(Requires -io-opt-copy-file-range) Also match copies whose write "
+             "length is a constant equal to the read count."));
 
 static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
   const char *Val = std::getenv(Name);
@@ -2112,6 +2141,292 @@ namespace {
     }
   };
 
+  // ------------------------------------------------------------------
+  // copy_file_range promotion.
+  //
+  // Recognises the "userspace bounce buffer" copy idiom:
+  //
+  //     n = read (src, buf, count);            write (dst, buf, n);
+  //     n = pread(src, buf, count, off_in);    pwrite(dst, buf, n, off_out);
+  //
+  // and rewrites it into a single in-kernel copy_file_range(), eliminating the
+  // user<->kernel bounce entirely.
+  //
+  // Phase style mirrors the rest of the plugin:
+  //   * Decision: purely analysis-driven matching + safety proof (no mutation).
+  //   * Emission: one transform per DominatorTree, then invalidate/refetch
+  //     (matches IOLoopHoistingPass), because the fallback path splits blocks.
+  //
+  // Scope (deliberately conservative for a first cut):
+  //   * read/write pair in the SAME basic block, W strictly after R.
+  //   * buf is a non-escaping alloca used ONLY as the syscall buffer of R and W
+  //     (a genuine dedicated bounce buffer) -- so removing the read cannot change
+  //     any other observable value.
+  //   * write length is exactly the read's SSA result (the provably-correct
+  //     short-read idiom), or -- under -io-opt-cfr-assume-full-reads -- a
+  //     constant equal to the read count.
+  //   * src and dst are not the same fd (avoids same-file overlap UB).
+  // ------------------------------------------------------------------
+  struct IOCopyFileRangePass : public PassInfoMixin<IOCopyFileRangePass> {
+
+    // True iff every use of the alloca reaches only R/W (as a syscall argument),
+    // pointer-forwarding casts/GEPs, or lifetime/debug intrinsics. No loads,
+    // stores, escapes, or other calls. This makes the read's bytes observable
+    // ONLY through W, so dropping the separate read is semantics-preserving.
+    static bool bufferIsPureBounce(AllocaInst *A, CallInst *R, CallInst *W) {
+      SmallVector<Use *, 16> Worklist;
+      for (Use &U : A->uses()) Worklist.push_back(&U);
+      while (!Worklist.empty()) {
+        Use *U = Worklist.pop_back_val();
+        auto *I = dyn_cast<Instruction>(U->getUser());
+        if (!I) return false;
+        if (I == R || I == W) continue;              // the two syscalls
+        if (isa<BitCastInst>(I) || isa<GetElementPtrInst>(I) ||
+            isa<AddrSpaceCastInst>(I)) {
+          for (Use &UU : I->uses()) Worklist.push_back(&UU);
+          continue;
+        }
+        if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+          Intrinsic::ID ID = II->getIntrinsicID();
+          if (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end ||
+              ID == Intrinsic::dbg_declare || ID == Intrinsic::dbg_value ||
+              ID == Intrinsic::dbg_label)
+            continue;
+        }
+        return false;                                // anything else: not pure
+      }
+      return true;
+    }
+
+    // Scan forward from R within its block for the paired write. Any intervening
+    // I/O call, or any non-readonly opaque call, aborts (we must not reorder the
+    // combined transfer past such effects).
+    static CallInst *findPairedWrite(CallInst *R, const IOArgs &RA, AllocaInst *A,
+                                     DominatorTree &DT, bool AssumeFullReads) {
+      const bool Explicit = (RA.Type == IOArgs::POSIX_PREAD);
+
+      auto dominatesR = [&](Value *V) -> bool {
+        if (auto *IV = dyn_cast<Instruction>(V)) return DT.dominates(IV, R);
+        return true; // args/constants/globals dominate everything
+      };
+
+      if (R->getMetadata("io.cfr.nofold")) return nullptr;
+
+      for (Instruction *I = R->getNextNode(); I; I = I->getNextNode()) {
+        auto *CI = dyn_cast<CallInst>(I);
+        if (!CI) continue; // non-call: buf is pure-bounce, so it can't touch buf
+
+        IOArgs WA = getIOArguments(CI);
+        if (WA.Type == IOArgs::NONE) {
+          // Opaque side-effecting call between R and W would be reordered.
+          if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return nullptr;
+          continue;
+        }
+
+        // First I/O call after R must be *our* matching write, else bail.
+        const bool WExplicit = (WA.Type == IOArgs::POSIX_PWRITE);
+        const bool WImplicit = (WA.Type == IOArgs::POSIX_WRITE);
+        if (Explicit ? !WExplicit : !WImplicit) return nullptr;
+
+        if (!WA.Buffer || getUnderlyingObject(WA.Buffer) != A) return nullptr;
+
+        // Length coupling.
+        bool LenOK = (WA.Length == R); // write exactly what read returned
+        if (!LenOK && AssumeFullReads) {
+          if (auto *RC = dyn_cast<ConstantInt>(RA.Length))
+            if (auto *WC = dyn_cast<ConstantInt>(WA.Length))
+              LenOK = (RC->getZExtValue() == WC->getZExtValue());
+        }
+        if (!LenOK) return nullptr;
+
+        // Distinct fds (avoid same-file overlap UB).
+        if (getBaseFD(R->getArgOperand(0)) == getBaseFD(CI->getArgOperand(0)))
+          return nullptr;
+
+        // W's own operands must be available at the (earlier) insertion point.
+        if (!dominatesR(CI->getArgOperand(0))) return nullptr;         // dst fd
+        if (Explicit && !dominatesR(CI->getArgOperand(3))) return nullptr; // off_out
+        if (CI->getMetadata("io.cfr.nofold")) return nullptr;
+
+        return CI;
+      }
+      return nullptr;
+    }
+
+    static bool transformPair(CallInst *R, CallInst *W, AllocaInst *A) {
+      Function *F = R->getFunction();
+      Module *M = F->getParent();
+      LLVMContext &C = M->getContext();
+      const DataLayout &DL = M->getDataLayout();
+
+      IOArgs RA = getIOArguments(R);
+      const bool Explicit = (RA.Type == IOArgs::POSIX_PREAD);
+
+      Type *SizeTy = DL.getIntPtrType(C);      // ssize_t/size_t width
+      Type *I32    = Type::getInt32Ty(C);
+      Type *I64    = Type::getInt64Ty(C);      // off_t assumed 64-bit (LFS)
+      PointerType *PtrTy = PointerType::getUnqual(C);
+
+      Value *SrcFd  = R->getArgOperand(0);
+      Value *DstFd  = W->getArgOperand(0);
+      Value *Buf    = RA.Buffer;
+      Value *Count  = RA.Length;
+      Value *OffInV  = Explicit ? R->getArgOperand(3) : nullptr;
+      Value *OffOutV = Explicit ? W->getArgOperand(3) : nullptr;
+
+      IRBuilder<> B(R);
+      FunctionCallee CFR = M->getOrInsertFunction(
+          "copy_file_range",
+          FunctionType::get(SizeTy, {I32, PtrTy, I32, PtrTy, SizeTy, I32}, false));
+
+      Value *SrcI = B.CreateIntCast(SrcFd, I32, /*isSigned=*/true);
+      Value *DstI = B.CreateIntCast(DstFd, I32, /*isSigned=*/true);
+      Value *LenS = B.CreateZExtOrTrunc(Count, SizeTy);
+      Value *NullP = ConstantPointerNull::get(PtrTy);
+      Value *OffInArg = NullP, *OffOutArg = NullP;
+
+      if (Explicit) {
+        // copy_file_range advances *the pointed-to offsets*, not the fd offset --
+        // exactly matching pread/pwrite, which don't touch the fd offset either.
+        IRBuilder<> EB(&F->getEntryBlock(), F->getEntryBlock().begin());
+        AllocaInst *InS  = EB.CreateAlloca(I64, nullptr, "cfr.offin");
+        AllocaInst *OutS = EB.CreateAlloca(I64, nullptr, "cfr.offout");
+        InS->setAlignment(Align(8));
+        OutS->setAlignment(Align(8));
+        B.CreateStore(B.CreateIntCast(OffInV, I64, true), InS);
+        B.CreateStore(B.CreateIntCast(OffOutV, I64, true), OutS);
+        OffInArg = InS;
+        OffOutArg = OutS;
+      }
+
+      CallInst *Rc = B.CreateCall(
+          CFR, {SrcI, OffInArg, DstI, OffOutArg, LenS, B.getInt32(0)}, "cfr.ret");
+
+      // ---- No-fallback mode: trust copy_file_range (documented caveat). ----
+      if (!EnableCFRFallback) {
+        Value *NRep = B.CreateIntCast(Rc, R->getType(), true);
+        Value *WRep = B.CreateIntCast(Rc, W->getType(), true);
+        W->replaceAllUsesWith(WRep);
+        R->replaceAllUsesWith(NRep);
+        W->eraseFromParent();
+        R->eraseFromParent();
+        NumCopyFileRange++;
+        logMessage("[IOOpt] SUCCESS: Promoted read+write bounce buffer to "
+                   "copy_file_range (no fallback).");
+        return true;
+      }
+
+      // ---- Fallback mode: on ENOSYS/EXDEV, re-run the original read+write. ----
+      // ENOSYS=38, EXDEV=18 on mainstream Linux/glibc (same caveat class as the
+      // hard-coded POSIX_FADV_* values elsewhere in this plugin).
+      Value *IsErr = B.CreateICmpSLT(Rc, ConstantInt::get(SizeTy, 0), "cfr.err");
+      FunctionCallee ErrLoc = M->getOrInsertFunction(
+          "__errno_location", FunctionType::get(PtrTy, {}, false));
+      Value *EP  = B.CreateCall(ErrLoc, {}, "cfr.errloc");
+      Value *Err = B.CreateLoad(I32, EP, "cfr.errno");
+      Value *Nosys = B.CreateICmpEQ(Err, ConstantInt::get(I32, 38));
+      Value *Xdev  = B.CreateICmpEQ(Err, ConstantInt::get(I32, 18));
+      Value *Need  = B.CreateAnd(IsErr, B.CreateOr(Nosys, Xdev), "cfr.need.fb");
+
+      BasicBlock *OrigBB = R->getParent();
+      BasicBlock *ContBB = OrigBB->splitBasicBlock(R, "cfr.cont");
+      BasicBlock *FbBB   = BasicBlock::Create(C, "cfr.fallback", F, ContBB);
+
+      // Rewrite OrigBB's (now-unconditional) terminator into the guard branch,
+      // materialising the success-path result casts before it.
+      Instruction *Term = OrigBB->getTerminator();
+      IRBuilder<> OB(Term);
+      Value *RcN = OB.CreateIntCast(Rc, R->getType(), true);
+      Value *RcW = OB.CreateIntCast(Rc, W->getType(), true);
+      Term->eraseFromParent();
+      BranchInst::Create(ContBB, ContBB, Need, OrigBB);
+
+      // Fallback: exact original calls (regular libc semantics preserved).
+      IRBuilder<> FB(FbBB);
+      CallInst *Fn, *Fw;
+      if (Explicit) {
+        Fn = FB.CreateCall(R->getCalledFunction(), {SrcFd, Buf, Count, OffInV});
+        Fw = FB.CreateCall(W->getCalledFunction(), {DstFd, Buf, Fn, OffOutV});
+      } else {
+        Fn = FB.CreateCall(R->getCalledFunction(), {SrcFd, Buf, Count});
+        Fw = FB.CreateCall(W->getCalledFunction(), {DstFd, Buf, Fn});
+      }
+      // Prevent the re-scan from re-folding the copy we just materialised as the
+      // ENOSYS/EXDEV fallback (that would nest fallbacks forever).
+      MDNode *NoFold = MDNode::get(C, {});
+      Fn->setMetadata("io.cfr.nofold", NoFold);
+      Fw->setMetadata("io.cfr.nofold", NoFold);
+      Value *FnN = FB.CreateIntCast(Fn, R->getType(), true);
+      Value *FwW = FB.CreateIntCast(Fw, W->getType(), true);
+      FB.CreateBr(ContBB);
+
+      // Merge results; both original calls' returns become these phis.
+      IRBuilder<> PB(&*ContBB->begin());
+      PHINode *NPhi = PB.CreatePHI(R->getType(), 2, "cfr.read.ret");
+      NPhi->addIncoming(RcN, OrigBB);
+      NPhi->addIncoming(FnN, FbBB);
+      PHINode *WPhi = PB.CreatePHI(W->getType(), 2, "cfr.write.ret");
+      WPhi->addIncoming(RcW, OrigBB);
+      WPhi->addIncoming(FwW, FbBB);
+
+      W->replaceAllUsesWith(WPhi);
+      R->replaceAllUsesWith(NPhi);
+      W->eraseFromParent();
+      R->eraseFromParent();
+
+      NumCopyFileRange++;
+      logMessage("[IOOpt] SUCCESS: Promoted read+write bounce buffer to "
+                 "copy_file_range (with ENOSYS/EXDEV fallback).");
+      return true;
+    }
+
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+      if (!EnableIOOpt || !EnableCopyFileRange) return PreservedAnalyses::all();
+      // copy_file_range only makes sense on seekable/regular files.
+      if (!AssumeRegularFiles) return PreservedAnalyses::all();
+
+      bool Changed = false, Again = true;
+      while (Again) {
+        Again = false;
+        DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+        CallInst *R = nullptr, *W = nullptr;
+        AllocaInst *A = nullptr;
+
+        for (BasicBlock &BB : F) {
+          for (Instruction &I : BB) {
+            auto *CI = dyn_cast<CallInst>(&I);
+            if (!CI) continue;
+            if (CI->getMetadata("io.cfr.nofold")) continue;
+            IOArgs a = getIOArguments(CI);
+            if (a.Type != IOArgs::POSIX_READ && a.Type != IOArgs::POSIX_PREAD)
+              continue;
+            if (!a.Buffer || !CI->getType()->isIntegerTy()) continue;
+
+            auto *Al = dyn_cast<AllocaInst>(getUnderlyingObject(a.Buffer));
+            if (!Al) continue;
+
+            CallInst *Cand = findPairedWrite(CI, a, Al, DT, CFRAssumeFullReads);
+            if (!Cand || !Cand->getType()->isIntegerTy()) continue;
+            if (!bufferIsPureBounce(Al, CI, Cand)) continue;
+
+            R = CI; W = Cand; A = Al;
+            break;
+          }
+          if (R) break;
+        }
+
+        if (R && transformPair(R, W, A)) {
+          Changed = true;
+          Again = true;
+          FAM.invalidate(F, PreservedAnalyses::none()); // block-split -> refetch DT
+        }
+      }
+      return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+  };
+
+
 }
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
@@ -2125,6 +2440,7 @@ llvmGetPassPluginInfo() {
         FPM.addPass(LoopSimplifyPass());
         FPM.addPass(LCSSAPass());
         FPM.addPass(IOLoopHoistingPass());   // separate pass -> analyses recomputed
+        FPM.addPass(IOCopyFileRangePass());
         FPM.addPass(IOBatchingPass());
         FPM.addPass(IOPrefetchPass());   // targets un-merged pread loops
         FPM.addPass(IOSequentialPrefetchPass()); // general offset free prefetch
@@ -2136,6 +2452,7 @@ llvmGetPassPluginInfo() {
         [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
           if (Name == "io-opt") {
             FPM.addPass(IOLoopHoistingPass());
+            FPM.addPass(IOCopyFileRangePass());
             FPM.addPass(IOBatchingPass());
             FPM.addPass(IOPrefetchPass());
             FPM.addPass(IOSequentialPrefetchPass());
