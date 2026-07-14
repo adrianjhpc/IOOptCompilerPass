@@ -19,7 +19,8 @@
 // so a single 409600-byte pwrite appears and NO vectored form is emitted.
 // CHECK-LABEL: define {{.*}}test_stride_eq_count
 // CHECK:     call{{.*}}@pwrite({{.*}}409600,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE void test_stride_eq_count(int fd, char *base, off_t off0) {
     for (int i = 0; i < N; i++)
         pwrite(fd, base + (long)i * 4096, 4096, off0 + (long)i * 4096);
@@ -29,7 +30,8 @@ NOINLINE void test_stride_eq_count(int fd, char *base, off_t off0) {
 // stale bytes. Must refuse; per-iteration pwrite survives.
 // CHECK-LABEL: define {{.*}}test_overlap
 // CHECK:     call{{.*}}@pwrite({{.*}}4096,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE void test_overlap(int fd, char *base, off_t off0) {
     for (int i = 0; i < N; i++)
         pwrite(fd, base + (long)i * 2048, 4096, off0 + (long)i * 4096);
@@ -40,7 +42,8 @@ NOINLINE void test_overlap(int fd, char *base, off_t off0) {
 // This is the corruption case; it is the most important negative in the suite.
 // CHECK-LABEL: define {{.*}}test_scratch_reuse
 // CHECK:     call{{.*}}@pwrite({{.*}}4096,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE void test_scratch_reuse(int fd, char *scratch, off_t off0) {
     for (int i = 0; i < N; i++)
         pwrite(fd, scratch, 4096, off0 + (long)i * 4096);
@@ -50,7 +53,8 @@ NOINLINE void test_scratch_reuse(int fd, char *scratch, off_t off0) {
 // across a dynamic loop, so the use_empty() gate must refuse.
 // CHECK-LABEL: define {{.*}}test_used_return
 // CHECK:     call{{.*}}@pwrite({{.*}}4096,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE ssize_t test_used_return(int fd, char *base, off_t off0) {
     ssize_t total = 0;
     for (int i = 0; i < N; i++)
@@ -62,7 +66,8 @@ NOINLINE ssize_t test_used_return(int fd, char *base, off_t off0) {
 // combined transfer; the hazard scan must refuse.
 // CHECK-LABEL: define {{.*}}test_interleaved_io
 // CHECK:     call{{.*}}@pwrite({{.*}}4096,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE void test_interleaved_io(int fd, int fd2, char *base, off_t off0) {
     for (int i = 0; i < N; i++) {
         pwrite(fd, base + (long)i * 8192, 4096, off0 + (long)i * 4096);
@@ -74,7 +79,8 @@ NOINLINE void test_interleaved_io(int fd, int fd2, char *base, off_t off0) {
 // a fixed iovcnt), so a symbolic n must refuse.
 // CHECK-LABEL: define {{.*}}test_runtime_tripcount
 // CHECK:     call{{.*}}@pwrite({{.*}}4096,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE void test_runtime_tripcount(int fd, char *base, off_t off0, int n) {
     for (int i = 0; i < n; i++)
         pwrite(fd, base + (long)i * 8192, 4096, off0 + (long)i * 4096);
@@ -85,7 +91,8 @@ NOINLINE void test_runtime_tripcount(int fd, char *base, off_t off0, int n) {
 // fail, so no pwritev is emitted.
 // CHECK-LABEL: define {{.*}}test_noncontiguous_offset
 // CHECK:     call{{.*}}@pwrite({{.*}}4096,
-// CHECK-NOT: writev
+// CHECK-NOT: call{{.*}}@writev(
+// CHECK-NOT: call{{.*}}@pwritev(
 NOINLINE void test_noncontiguous_offset(int fd, char *base, off_t off0) {
     for (int i = 0; i < N; i++)
         pwrite(fd, base + (long)i * 8192, 4096, off0 + (long)i * 8192);
