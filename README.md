@@ -7,8 +7,8 @@
 overhead. It recognises a wide range of user-space I/O calls in the IR, proves
 when it is safe to combine them, and rewrites them into fewer, larger, and
 better-shaped operations — scatter/gather vectors (`readv`/`writev`/`preadv`/`pwritev`),
-coalesced buffers, zero-copy kernel transfers, hoisted whole-loop transfers, and
-optional kernel read-ahead hints (`posix_fadvise`).
+coalesced buffers, zero-copy kernel transfers, in-kernel copies (`copy_file_range`),
+hoisted whole-loop transfers, and optional kernel read-ahead hints (`posix_fadvise`).
 
 All transforms are guarded by Alias Analysis (AA), Scalar Evolution (SCEV),
 Dominator/Post-Dominator trees and MemorySSA. When safety cannot be proven, the
@@ -47,6 +47,9 @@ analyses between mutating stages:
    arguments) and inlines a call to such a wrapper when it directly follows I/O on
    the *same* file descriptor in the caller. This exposes cross-function I/O chains
    to the later batching passes. Runs iteratively until it reaches a fixed point.
+   (Runs in the `io-lto-merge` pipeline, under standard `-flto`, or when
+   `-io-opt-early-ipo` is set — *not* in the plain function-level `-passes=io-opt`
+   path.)
 
 2. **`IOLoopHoistingPass`** *(function)* — Uses `LoopInfo` + `ScalarEvolution` +
    `MemorySSA` + AA to prove that a per-iteration read/write over a contiguous,
@@ -56,7 +59,34 @@ analyses between mutating stages:
    *O(1)*. After any hoist it invalidates and refetches analyses before touching
    further loops.
 
-3. **`IOBatchingPass`** *(function)* — The core coalescing engine. A three-phase
+3. **`IOCopyFileRangePass`** *(function, opt-in)* — Recognises the userspace
+   "bounce buffer" copy idiom:
+
+   ```c
+   n = read (src, buf, count);            write (dst, buf, n);
+   n = pread(src, buf, count, off_in);    pwrite(dst, buf, n, off_out);
+   ```
+
+   and rewrites it into a single in-kernel `copy_file_range()`, eliminating the
+   user↔kernel bounce entirely. Fires only when:
+   * the read and write are in the **same** basic block, write strictly after read;
+   * `buf` is a **non-escaping alloca** used *only* as the syscall buffer of the two
+     calls (a genuine dedicated bounce buffer), so dropping the separate read cannot
+     change any other observable value;
+   * the write length is exactly the read's SSA result (the provably-correct
+     short-read idiom), or — under `-io-opt-cfr-assume-full-reads` — a constant equal
+     to the read count;
+   * `src` and `dst` are distinct fds (avoids same-file overlap UB).
+
+   By default (`-io-opt-cfr-fallback`) the promoted call is guarded by a runtime
+   fallback that re-runs the original read+write on `ENOSYS` (old kernel) or `EXDEV`
+   (cross-filesystem), merging both return values with phis; both errnos occur
+   *before* any bytes are copied, so the fallback starts from an unperturbed
+   position. Performs one transform per DominatorTree, then invalidates/refetches
+   (the fallback path splits blocks). Synthesised fallback calls are tagged
+   `io.cfr.nofold` so the re-scan never re-folds its own fallback.
+
+4. **`IOBatchingPass`** *(function)* — The core coalescing engine. A three-phase
    design:
    * **Decide:** walk each block read-only, growing per-fd batches and closing them
      on hazards, fd reassignment, opaque calls, sync points, or the high-water mark.
@@ -65,12 +95,12 @@ analyses between mutating stages:
      (insert-only, so analyses stay valid across all batches).
    * **Emit:** pure code generation that consults no analyses.
 
-4. **`IOPrefetchPass`** *(function, opt-in)* — For analyzable, statically-bounded,
+5. **`IOPrefetchPass`** *(function, opt-in)* — For analyzable, statically-bounded,
    forward-contiguous `pread` loops with a single count-controlled exit, inserts a
    single `posix_fadvise(POSIX_FADV_WILLNEED)` over the exact range the loop will
    consume.
 
-5. **`IOSequentialPrefetchPass`** *(function, opt-in)* — Emits a whole-file
+6. **`IOSequentialPrefetchPass`** *(function, opt-in)* — Emits a whole-file
    `posix_fadvise` mode hint for read loops that iterate at least 4 times:
    * `SEQUENTIAL` for `read`/`fread` loops (unless a seek perturbs the position) and
      for contiguous / small-gap `pread` addrecs;
@@ -107,6 +137,9 @@ propagation, `fread`/`fwrite` element-count division (with divide-by-zero guard)
 any *used* return value would be needed *before* the merge point, the batch is
 rejected outright rather than mis-optimised (`NumBatchesRejectedUnsafeUse`).
 
+`copy_file_range` promotion likewise reconstructs both the read's and the write's
+return values (via phis when the ENOSYS/EXDEV fallback is enabled).
+
 ---
 
 ## Safety model
@@ -132,7 +165,8 @@ Merging N writes into one `writev`, or collapsing a loop into one transfer, chan
 `PIPE_BUF` atomicity on pipes/FIFOs and message boundaries on datagram/seqpacket
 sockets. IOOpt cannot prove "regular file" from IR, so this is governed by a single switch: **`-io-opt-assume-regular-files` (default: on)**. Disable it if your
 batched fds may be pipes, FIFOs, or datagram/seqpacket sockets — this also disables
-batching, loop hoisting, and prefetch, all of which share the assumption.
+batching, loop hoisting, `copy_file_range` promotion, and prefetch, all of which
+share the assumption.
 
 ---
 
@@ -144,12 +178,73 @@ These are LLVM `cl::opt` booleans. Pass them to the plugin via `-mllvm` (or
 | Flag | Default | Effect |
 |---|---|---|
 | `-enable-io-opt` | `true` | Master enable for batching/hoisting transforms. |
-| `-io-opt-assume-regular-files` | `true` | Assume batched fds are regular files (see caveat). Disabling it turns off batching, hoisting, and prefetch. |
+| `-io-opt-assume-regular-files` | `true` | Assume batched fds are regular files (see caveat). Disabling it turns off batching, hoisting, `copy_file_range`, and prefetch. |
 | `-io-opt-early-ipo` | `false` | Also inject interprocedural wrapper inlining at pipeline *start* (the explicit `io-lto-merge` pipeline and standard `-flto` always run it regardless). |
+| `-io-opt-copy-file-range` | `false` | Promote read+write / pread+pwrite bounce-buffer copies into a single in-kernel `copy_file_range` — see [copy_file_range promotion](#-copy_file_range-promotion-opt-in). |
+| `-io-opt-cfr-fallback` | `true` | Guard `copy_file_range` with a read/write fallback on `ENOSYS`/`EXDEV` (preserves old-kernel / cross-filesystem correctness). |
+| `-io-opt-cfr-assume-full-reads` | `false` | (requires `-io-opt-copy-file-range`) Also match copies whose write length is a constant equal to the read count (changes short-read/EOF behaviour). |
 | `-io-opt-prefetch` | `false` | **Master opt-in** for the entire `posix_fadvise` prefetch family — see [Prefetch / Read-ahead hints](#-prefetch--read-ahead-hints-opt-in). |
 | `-io-opt-prefetch-willneed` | `true` | (requires master) `WILLNEED` for analyzable `pread` ranges. |
 | `-io-opt-prefetch-sequential` | `true` | (requires master) `SEQUENTIAL` for monotonic contiguous read loops. |
 | `-io-opt-prefetch-random` | `true` | (requires master) `RANDOM` to suppress read-ahead on strided/non-affine `pread` loops. |
+
+---
+
+## 📄 copy_file_range promotion (opt-in)
+
+IOOpt can collapse the classic userspace "bounce buffer" copy — read into a
+temporary, then write it back out — into a single in-kernel `copy_file_range()`,
+removing the user↔kernel data bounce entirely.
+
+This is **off by default**, because it changes the syscall surface and has real
+`EXDEV`/`ENOSYS` edge cases. Enable it with:
+
+```bash
+-io-opt-copy-file-range
+```
+
+### What it matches
+
+```c
+// implicit-offset form (uses the fd's current position)
+n = read(src, buf, count);
+write(dst, buf, n);
+
+// explicit-offset form (copy_file_range advances the pointed-to offsets,
+// exactly like pread/pwrite leave the fd offset untouched)
+n = pread(src, buf, count, off_in);
+pwrite(dst, buf, n, off_out);
+```
+
+Matching is deliberately conservative for correctness:
+
+* read and write must be in the **same basic block**, write strictly after read;
+* `buf` must be a **non-escaping alloca** used *only* by those two syscalls (plus
+  pointer-forwarding casts/GEPs and lifetime/debug intrinsics) — a genuine dedicated
+  bounce buffer;
+* the write length must be **exactly the read's SSA result** (the provably-correct
+  short-read idiom). Under `-io-opt-cfr-assume-full-reads` a *constant* write length
+  equal to the read count is also matched, at the cost of changing behaviour on the
+  short-read/EOF edge;
+* `src` and `dst` must be **distinct fds** (avoids same-file overlap UB);
+* no intervening I/O call, and no non-readonly opaque call, may sit between the read
+  and the write (that would be reordered past the combined transfer).
+
+### Fallback behaviour (default on)
+
+With `-io-opt-cfr-fallback` (the default), the emitted code guards the
+`copy_file_range` call: if it fails with `ENOSYS` (kernel too old) or `EXDEV`
+(cross-filesystem copy), the original `read`+`write` pair is re-run and the two
+return values are merged back with phis. Because both errnos are reported *before*
+any bytes are copied, the fallback re-read/-write starts from an unperturbed
+position, so a working cross-mount copy is never turned into a hard failure.
+
+Disabling the fallback (`-io-opt-cfr-fallback=false`) trusts `copy_file_range`
+unconditionally and emits smaller code, but will fail on old kernels or cross-mount
+copies — only use it when you control the deployment environment.
+
+> **Note:** `copy_file_range` promotion also requires `-io-opt-assume-regular-files`
+> (the default), since it only makes sense on seekable/regular files.
 
 ---
 
@@ -246,8 +341,8 @@ unparseable value) falls back to the default for these threshold-style variables
 Compile-time counters are exposed through LLVM's `-stats` machinery:
 
 `NumFunctionsAnalyzed`, `NumBatchesMerged`, `NumLoopsHoisted`, `NumZeroCopy`,
-`NumIPAInlines`, `NumBatchesRejectedUnsafeUse`, `NumPrefetchHints`, `NumSeqHints`,
-`NumRandomHints`.
+`NumIPAInlines`, `NumBatchesRejectedUnsafeUse`, `NumCopyFileRange`,
+`NumPrefetchHints`, `NumSeqHints`, `NumRandomHints`.
 
 ---
 
@@ -354,14 +449,23 @@ opt -load-pass-plugin=./libIOOpt.so \
     -passes=io-opt in.ll -S -o out.ll
 ```
 
+Enable `copy_file_range` promotion:
+```bash
+opt -load-pass-plugin=./libIOOpt.so \
+    -io-opt-copy-file-range \
+    -passes=io-opt in.ll -S -o out.ll
+```
+
 ---
 
 ## Caveats & assumptions
 
-* **`off_t` is assumed 64-bit** (Large File Support). Prefetch offset/length
-  arguments are emitted as `i64`.
+* **`off_t` is assumed 64-bit** (Large File Support). Prefetch and
+  `copy_file_range` offset/length arguments are emitted as `i64`.
 * **`POSIX_FADV_*` constants** are hard-coded to their mainstream Linux/glibc values
   (`RANDOM=1`, `SEQUENTIAL=2`, `WILLNEED=3`).
+* **`ENOSYS`/`EXDEV` constants** used by the `copy_file_range` fallback are likewise
+  hard-coded to their mainstream Linux/glibc values (`ENOSYS=38`, `EXDEV=18`).
 * **fd identity** is tracked through a load-from-slot, so a stored-then-reloaded fd
   compares equal across batching and prefetch decisions.
 * Correctness of batch ordering never relies on fd-identity keys alone — every
