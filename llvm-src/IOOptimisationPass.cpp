@@ -193,8 +193,10 @@ namespace {
     enum {
       NONE, C_FWRITE, C_FREAD, POSIX_WRITE, POSIX_READ, POSIX_PWRITE, POSIX_PREAD,
       CXX_WRITE, CXX_READ, MPI_WRITE_AT, MPI_READ_AT,
-      SPLICE, SENDFILE, POSIX_PWRITEV, POSIX_PREADV, IO_SUBMIT, AIO_WRITE
+      SPLICE, SENDFILE, POSIX_PWRITEV, POSIX_PREADV, IO_SUBMIT, AIO_WRITE,
+      C_FPUTC
     } Type;
+    Value *ScalarData = nullptr;    // the int char value for C_FPUTC
   };
 
   Value *getBaseFD(Value *Target) {
@@ -273,6 +275,19 @@ namespace {
       Value *Bytes = getCStreamBytes(Call);
       return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : NONE;
     }
+
+    // Functionality to capture fputc or putc calls
+    // int fputc(int c, FILE *stream); int putc(int c, FILE *stream);
+    if (isSymbolName(Name, "fputc") || isSymbolName(Name, "putc") ||
+        isSymbolName(Name, "_IO_putc")) {
+      if (!need(2) || !isInt(0) || !isPtr(1)) return NONE;
+      IOArgs A{Call->getArgOperand(1), /*Buffer=*/nullptr,
+               ConstantInt::get(Type::getInt64Ty(Call->getContext()), 1),
+               IOArgs::C_FPUTC};
+      A.ScalarData = Call->getArgOperand(0);   // the char (as int)
+      return A;
+    }
+
 
     if (isSymbolName(Name, "preadv") || isSymbolName(Name, "preadv2")) {
       if (!need(3) || !isPtr(1)) return NONE;
@@ -532,7 +547,8 @@ namespace {
       return false;
     }
 
-    if (!FirstArgs.Buffer || !NewArgs.Buffer) return false;
+    bool isCharBatch = (FirstArgs.Type == IOArgs::C_FPUTC);
+    if (!isCharBatch && (!FirstArgs.Buffer || !NewArgs.Buffer)) return false;
 
     bool isReadBatch = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD ||
                         FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::MPI_READ_AT ||
@@ -737,13 +753,22 @@ namespace {
     return true;
   }
 
-  enum class IOPattern { Contiguous, Strided, ShadowBuffer, DynamicShadowBuffer, Vectored, Unprofitable };
+  enum class IOPattern { Contiguous, Strided, ShadowBuffer, DynamicShadowBuffer, Vectored, CharGather, Unprofitable };
 
   IOPattern classifyBatch(const SmallVectorImpl<CallInst*> &Batch, const DataLayout &DL,
                           uint64_t &OutTotalRange, ScalarEvolution *SE) {
     if (Batch.size() < 2) return IOPattern::Unprofitable;
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
+
+    // Char writes have no source buffers and always coalesce into one fwrite.
+    if (FirstArgs.Type == IOArgs::C_FPUTC) {
+      uint64_t Total = Batch.size();               // one byte each
+      if (Total == 0 || Total > Config.ShadowBufferSize) return IOPattern::Unprofitable;
+      OutTotalRange = Total;
+      return IOPattern::CharGather;
+    }
+
     bool isReadBatch = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD ||
                         FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::CXX_READ);
 
@@ -1164,6 +1189,44 @@ namespace {
       logMessage("[IOOpt] SUCCESS: N-Way converted " + Twine(Batch.size()) + " " + (isRead ? "reads" : "writes") + " to " + FuncName + "!");
       break;
     }
+
+    case IOPattern::CharGather: {
+      Type *Int8Ty = InsertBuilder.getInt8Ty();
+      ArrayType *ArrTy = ArrayType::get(Int8Ty, Batch.size());
+
+      IRBuilder<> EntryBuilder(&ThisF->getEntryBlock(), ThisF->getEntryBlock().begin());
+      AllocaInst *CharBuf = EntryBuilder.CreateAlloca(ArrTy, nullptr, "fputc.gather.buf");
+      CharBuf->setAlignment(Align(16));
+
+      // Store each char byte at its original call site (value dominates it there).
+      for (size_t i = 0; i < Batch.size(); ++i) {
+        IOArgs Args = getIOArguments(Batch[i]);
+        IRBuilder<> CallBuilder(Batch[i]);
+        Value *Byte = CallBuilder.CreateTrunc(Args.ScalarData, Int8Ty, "fputc.byte");
+        Value *Slot = CallBuilder.CreateInBoundsGEP(
+            ArrTy, CharBuf, {CallBuilder.getInt64(0), CallBuilder.getInt64(i)});
+        CallBuilder.CreateStore(Byte, Slot);
+      }
+
+      Type *SizeTy = DL.getIntPtrType(M->getContext());
+      PointerType *PtrTy = InsertBuilder.getPtrTy();
+      FunctionCallee Fwrite = M->getOrInsertFunction(
+          "fwrite", FunctionType::get(SizeTy, {PtrTy, SizeTy, SizeTy, PtrTy}, false));
+
+      Value *BufPtr = InsertBuilder.CreatePointerCast(CharBuf, PtrTy);
+      Value *StreamPtr = FirstArgs.Target;
+      if (StreamPtr->getType() != PtrTy && StreamPtr->getType()->isPointerTy())
+        StreamPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(StreamPtr, PtrTy);
+
+      MergedCall = InsertBuilder.CreateCall(
+          Fwrite, {BufPtr, ConstantInt::get(SizeTy, 1),
+                   ConstantInt::get(SizeTy, Batch.size()), StreamPtr});
+      NumBatchesMerged++;
+      logMessage("[IOOpt] SUCCESS: Coalesced " + Twine(Batch.size()) +
+                 " fputc/putc calls into one fwrite.");
+      break;
+    }
+
     default: break;
     }
 
@@ -1214,6 +1277,16 @@ namespace {
         Rep = C->getArgOperand(0);                       // ostream& (the stream)
       } else if (CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::MPI_READ_AT) {
         Rep = RetBuilder.getInt32(0);                    // MPI_SUCCESS
+      } else if (CArgs.Type == IOArgs::C_FPUTC) {
+        // fwrite (elem size 1) returns R = #chars written. Char i is written
+        // iff R > i (== Prefix here). fputc returns (int)(unsigned char)c on
+        // success, EOF (-1) on error.
+        Value *Wrote = RetBuilder.CreateICmpUGT(R, Prefix, "io.fputc.ok");
+        Value *CharI = RetBuilder.CreateAnd(
+            RetBuilder.CreateIntCast(CArgs.ScalarData, C->getType(), /*isSigned=*/false),
+            ConstantInt::get(C->getType(), 0xFF));
+        Rep = RetBuilder.CreateSelect(
+            Wrote, CharI, ConstantInt::get(C->getType(), (uint64_t)-1), "io.fputc.ret");
       } else if (RetIsInt && ByteLen) {
         // clamp(R - Prefix, 0, ByteLen)
         Value *Avail  = RetBuilder.CreateSub(R, Prefix, "io.avail");
@@ -1573,7 +1646,12 @@ namespace {
           }
 
           IOArgs CArgs = getIOArguments(Call, CalleeF);
-          bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE || CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::SPLICE || CArgs.Type == IOArgs::SENDFILE || CArgs.Type == IOArgs::IO_SUBMIT || CArgs.Type == IOArgs::AIO_WRITE);
+          bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE ||
+                          CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE ||
+                          CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::SPLICE ||
+                          CArgs.Type == IOArgs::SENDFILE || CArgs.Type == IOArgs::IO_SUBMIT ||
+                          CArgs.Type == IOArgs::AIO_WRITE || CArgs.Type == IOArgs::C_FPUTC);
+
           bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD || CArgs.Type == IOArgs::POSIX_PREAD || CArgs.Type == IOArgs::MPI_READ_AT || CArgs.Type == IOArgs::CXX_READ);
 
           if (!isWrite && !isRead) continue;
