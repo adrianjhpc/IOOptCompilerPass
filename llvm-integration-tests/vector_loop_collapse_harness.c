@@ -48,6 +48,17 @@ static void caseD_scatter(int fd, char *buf) {
         pwrite(fd, buf + (long)i * 2 * BLK, BLK, (off_t)i * BLK);
 }
 
+// Tier / CFR-loop: copy IN -> OUT via a read/write loop.
+// -fno-inline keeps it intact so the copy_file_range loop promotion can fire.
+__attribute__((noinline))
+static void caseE_copy(int src, int dst) {
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(src, buf, sizeof buf)) > 0)
+        write(dst, buf, n);
+}
+
+
 static int write_all(int fd, const char *b, size_t n) {   /* for the B read-back */
     size_t off = 0;
     while (off < n) {
@@ -88,6 +99,18 @@ int main(int argc, char **argv) {
         int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return 3;
         caseD_scatter(fd, buf);
         close(fd); free(buf); return 0;
+    }
+    if (mode == 'E') {                       // E OUT IN
+        const char *out = argv[2], *in = argv[3];
+        int fdi = open(in, O_RDONLY);
+        if (fdi < 0) return 4;
+        int fdo = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fdo < 0) { close(fdi); return 3; }
+        caseE_copy(fdi, fdo);
+        fsync(fdo);                          // force durability before hashing
+        close(fdo);
+        close(fdi);
+        return 0;
     }
     fprintf(stderr, "unknown mode %c\n", mode); return 2;
 }

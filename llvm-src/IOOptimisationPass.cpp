@@ -73,6 +73,8 @@ STATISTIC(NumSeqHints, "Number of posix_fadvise(SEQUENTIAL) hints inserted");
 STATISTIC(NumRandomHints, "Number of posix_fadvise(RANDOM) hints inserted");
 STATISTIC(NumCopyFileRange, "Number of read+write bounce buffers promoted to copy_file_range");
 STATISTIC(NumLoopsVectorCollapsed, "Number of scatter I/O loops collapsed to writev/pwritev");
+STATISTIC(NumCFRLoops, "Number of read/write copy loops promoted to copy_file_range");
+
 
 // --- Master enable + gating flags (Don't transform aggressively just
 // because the plugin is loaded). ---
@@ -157,6 +159,12 @@ static cl::opt<bool> EnableDynamicTrips(
 					"io-opt-loop-hoist-dynamic-trips", cl::init(false), cl::Hidden,
 					cl::desc("Allow loop I/O collapse with a runtime (symbolic) trip "
 						 "count; uses a conservative AA range (opt-in)."));
+
+static cl::opt<bool> EnableCFRLoops(
+				    "io-opt-cfr-loops", cl::init(false), cl::Hidden,
+				    cl::desc("(Requires -io-opt-copy-file-range) Recognize read/write COPY "
+					     "LOOPS as copy_file_range candidates. Step 1: recognition + "
+					     "tagging (!io.cfr.candidate) only, no transform."));
 
 static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
   const char *Val = std::getenv(Name);
@@ -256,6 +264,12 @@ namespace {
       C_FPUTC, C_FPUTS, C_PUTS
     } Type;
     Value *ScalarData = nullptr;    // the int char value for C_FPUTC
+  };
+
+  struct CfrLoopInfo {
+    BasicBlock *G=nullptr, *P=nullptr, *Done=nullptr;   // Done = guard's EOF target
+    CallInst *Rguard=nullptr;
+    Value *Src=nullptr, *Dst=nullptr, *Count=nullptr;
   };
 
   Value *getBaseFD(Value *Target) {
@@ -2618,6 +2632,262 @@ namespace {
       return true;
     }
 
+    // Pure-bounce check allowing a SET of I/O calls (rotation duplicates the
+    // read, so more than one read call may legitimately touch the buffer).
+    static bool copyBounceOK(AllocaInst *A, ArrayRef<CallInst*> Allowed) {
+      SmallPtrSet<CallInst*, 4> AllowSet(Allowed.begin(), Allowed.end());
+      SmallVector<Use*, 16> WL;
+      for (Use &U : A->uses()) WL.push_back(&U);
+      while (!WL.empty()) {
+        Use *U = WL.pop_back_val();
+        auto *I = dyn_cast<Instruction>(U->getUser());
+        if (!I) return false;
+        if (auto *CI = dyn_cast<CallInst>(I)) {
+          if (AllowSet.count(CI)) continue;
+          if (auto *II = dyn_cast<IntrinsicInst>(CI)) {
+            Intrinsic::ID id = II->getIntrinsicID();
+            if (id == Intrinsic::lifetime_start || id == Intrinsic::lifetime_end ||
+                id == Intrinsic::dbg_declare || id == Intrinsic::dbg_value ||
+                id == Intrinsic::dbg_label)
+              continue;
+          }
+          return false;
+        }
+        if (isa<BitCastInst>(I) || isa<GetElementPtrInst>(I) ||
+            isa<AddrSpaceCastInst>(I)) {
+          for (Use &UU : I->uses()) WL.push_back(&UU);
+          continue;
+        }
+        return false;
+      }
+      return true;
+    }
+
+    static bool recognizeCopyLoopCandidate(Loop *L, DominatorTree &DT,
+                                           SmallVectorImpl<CallInst*> &ReadsOut,
+                                           CallInst *&WOut) {
+      if (!L->isLoopSimplifyForm()) return false;
+      BasicBlock *Exiting = L->getExitingBlock();
+      BasicBlock *ExitBB  = L->getExitBlock();
+      if (!Exiting || !ExitBB || !L->getLoopLatch()) return false;
+
+      CallInst *R = nullptr, *W = nullptr;
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB) {
+          if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (auto *II = dyn_cast<IntrinsicInst>(CI)) {
+              Intrinsic::ID id = II->getIntrinsicID();
+              if (id == Intrinsic::lifetime_start || id == Intrinsic::lifetime_end ||
+                  id == Intrinsic::dbg_value || id == Intrinsic::dbg_declare ||
+                  id == Intrinsic::dbg_label || id == Intrinsic::assume)
+                continue;
+            }
+            IOArgs a = getIOArguments(CI);
+            if (a.Type == IOArgs::POSIX_READ)       { if (R) return false; R = CI; }
+            else if (a.Type == IOArgs::POSIX_WRITE) { if (W) return false; W = CI; }
+            else return false;
+          } else if (I.mayWriteToMemory()) {
+            return false;
+          }
+        }
+      if (!R || !W) return false;
+
+      IOArgs RA = getIOArguments(R), WA = getIOArguments(W);
+      if (!RA.Buffer || !WA.Buffer) return false;
+
+      auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(RA.Buffer));
+      if (!A || getUnderlyingObject(WA.Buffer) != A) return false;
+
+      if (getBaseFD(R->getArgOperand(0)) == getBaseFD(W->getArgOperand(0)))
+        return false;
+
+      // Collect the reads that fill buf: R, plus (rotated) the phi incomings.
+      SmallPtrSet<CallInst*, 4> ReadSet; ReadSet.insert(R);
+      Value *WLen = WA.Length;
+      bool lenOK = (WLen == R);
+      if (!lenOK) {
+        if (auto *PN = dyn_cast<PHINode>(WLen)) {
+          lenOK = true;
+          for (Value *IV : PN->incoming_values()) {
+            auto *IC = dyn_cast<CallInst>(IV);
+            if (!IC) { lenOK = false; break; }
+            IOArgs IA = getIOArguments(IC);
+            if (IA.Type != IOArgs::POSIX_READ ||
+                getUnderlyingObject(IA.Buffer) != A ||
+                getBaseFD(IC->getArgOperand(0)) != getBaseFD(R->getArgOperand(0))) {
+              lenOK = false; break;
+            }
+            ReadSet.insert(IC);
+          }
+        }
+      }
+      if (!lenOK) return false;
+
+      SmallVector<CallInst*, 4> Reads(ReadSet.begin(), ReadSet.end());
+      SmallVector<CallInst*, 8> Allowed(Reads.begin(), Reads.end());
+      Allowed.push_back(W);
+      if (!copyBounceOK(A, Allowed)) return false;
+
+      auto *Br = dyn_cast<BranchInst>(Exiting->getTerminator());
+      if (!Br || !Br->isConditional()) return false;
+      auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+      if (!Cmp || (Cmp->getOperand(0) != R && Cmp->getOperand(1) != R)) return false;
+
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          for (User *U : I.users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI || !L->contains(UI)) return false;
+          }
+      if (!W->use_empty()) return false;
+
+      // dst fd must dominate every read (we place a cfr call at each read that
+      // uses dst). src is each read's own operand -> trivially dominates.
+      Value *Dst = W->getArgOperand(0);
+      auto dominatesAt = [&](Value *V, Instruction *At) {
+        if (auto *I = dyn_cast<Instruction>(V)) return DT.dominates(I, At);
+        return true; // argument / constant / global
+      };
+      for (CallInst *Ri : Reads)
+        if (!dominatesAt(Dst, Ri)) return false;
+
+      ReadsOut.assign(Reads.begin(), Reads.end());
+      WOut = W;
+      return true;
+    }
+
+    static bool analyzeCfrLoopStructure(Loop *L, CallInst *W, DominatorTree &DT,
+                                        CfrLoopInfo &Out) {
+      BasicBlock *P = L->getLoopPreheader();
+      if (!P) return false;
+
+      IOArgs WA = getIOArguments(W);
+      auto *PN = dyn_cast<PHINode>(WA.Length);          // rotated form
+      if (!PN) return false;
+      auto *Rg = dyn_cast<CallInst>(PN->getIncomingValueForBlock(P));
+      if (!Rg || getIOArguments(Rg).Type != IOArgs::POSIX_READ) return false;
+
+      BasicBlock *G = Rg->getParent();
+      if (P->getSinglePredecessor() != G) return false;
+
+      auto *Br = dyn_cast<BranchInst>(G->getTerminator());
+      if (!Br || !Br->isConditional()) return false;
+      BasicBlock *S0 = Br->getSuccessor(0), *S1 = Br->getSuccessor(1);
+      BasicBlock *Done = (S0==P) ? S1 : (S1==P ? S0 : nullptr);  // guard's EOF edge
+      if (!Done) return false;
+      if (!Done->phis().empty()) return false;          // we add cfr -> Done edges
+
+      auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+      if (!Cmp || (Cmp->getOperand(0)!=Rg && Cmp->getOperand(1)!=Rg)) return false;
+
+      Value *Dst = W->getArgOperand(0);
+      if (auto *DI = dyn_cast<Instruction>(Dst))
+        if (!DT.dominates(DI, Rg)) return false;
+
+      Out.G=G; Out.P=P; Out.Done=Done; Out.Rguard=Rg;
+      Out.Src=Rg->getArgOperand(0);
+      Out.Dst=Dst;
+      Out.Count=Rg->getArgOperand(2);
+      return true;
+    }
+
+    // Step-2 codegen: NO fallback. Replace each read with copy_file_range and
+    // delete the (lagged) write, in place. Used only when -io-opt-cfr-fallback
+    // is OFF -- documented as same-filesystem / current-kernel only.
+    static void transformCopyLoop(ArrayRef<CallInst*> Reads, CallInst *W) {
+      Module *M = W->getModule();
+      LLVMContext &C = M->getContext();
+      const DataLayout &DL = M->getDataLayout();
+      Type *SizeTy = DL.getIntPtrType(C);
+      Type *I32 = Type::getInt32Ty(C);
+      PointerType *PtrTy = PointerType::getUnqual(C);
+
+      FunctionCallee CFR = M->getOrInsertFunction(
+						  "copy_file_range",
+						  FunctionType::get(SizeTy, {I32, PtrTy, I32, PtrTy, SizeTy, I32}, false));
+      Value *NullP = ConstantPointerNull::get(PtrTy);
+
+      Value *Dst = W->getArgOperand(0);   // capture before erasing W
+      W->eraseFromParent();               // lagged write; result unused
+
+      for (CallInst *R : Reads) {
+        IRBuilder<> B(R);
+        Value *Src  = B.CreateIntCast(R->getArgOperand(0), I32, /*signed=*/true);
+        Value *DstI = B.CreateIntCast(Dst, I32, /*signed=*/true);
+        Value *Len  = B.CreateZExtOrTrunc(R->getArgOperand(2), SizeTy);
+        CallInst *Rc = B.CreateCall(
+				    CFR, {Src, NullP, DstI, NullP, Len, B.getInt32(0)}, "cfr.copy");
+        Value *Rep = Rc;
+        if (R->getType() != Rc->getType())
+          Rep = B.CreateIntCast(Rc, R->getType(), /*signed=*/true);
+        R->replaceAllUsesWith(Rep);
+        R->eraseFromParent();
+      }
+      NumCFRLoops++;
+      logMessage("[IOOpt] SUCCESS: promoted read/write copy loop to "
+                 "copy_file_range (NO fallback).");
+    }
+
+
+    static void transformCopyLoopFallback(CfrLoopInfo &I) {
+      Module *M = I.G->getModule();
+      LLVMContext &C = M->getContext();
+      const DataLayout &DL = M->getDataLayout();
+      Type *SizeTy = DL.getIntPtrType(C);
+      Type *I32 = Type::getInt32Ty(C);
+      PointerType *PtrTy = PointerType::getUnqual(C);
+      Function *F = I.G->getParent();
+
+      FunctionCallee CFR = M->getOrInsertFunction("copy_file_range",
+						  FunctionType::get(SizeTy, {I32,PtrTy,I32,PtrTy,SizeTy,I32}, false));
+      FunctionCallee ErrLoc = M->getOrInsertFunction("__errno_location",
+						     FunctionType::get(PtrTy, {}, false));
+      Value *NullP = ConstantPointerNull::get(PtrTy);
+
+      // Split the guard block BEFORE the guard read. Gtail holds the read +
+      // guard branch (the untouched original loop entry); G keeps the alloca etc.
+      BasicBlock *Gtail = I.G->splitBasicBlock(I.Rguard->getIterator(), "cfr.guard");
+      BasicBlock *Head = I.G;   // now ends in `br Gtail`
+
+      BasicBlock *Probe = BasicBlock::Create(C, "cfr.probe", F, Gtail);
+      BasicBlock *Check = BasicBlock::Create(C, "cfr.check", F, Gtail);
+      BasicBlock *Loop  = BasicBlock::Create(C, "cfr.loop",  F, Gtail);
+
+      // Head -> Gtail  becomes  Head -> Probe.
+      Head->getTerminator()->replaceSuccessorWith(Gtail, Probe);
+
+      auto emitCfr = [&](IRBuilder<> &B) {
+        Value *S = B.CreateIntCast(I.Src, I32, true);
+        Value *D = B.CreateIntCast(I.Dst, I32, true);
+        Value *N = B.CreateZExtOrTrunc(I.Count, SizeTy);
+        return B.CreateCall(CFR, {S, NullP, D, NullP, N, B.getInt32(0)}, "cfr");
+      };
+
+      IRBuilder<> PB(Probe);
+      Value *R0 = emitCfr(PB);
+      Value *IsErr = PB.CreateICmpSLT(R0, ConstantInt::get(SizeTy,0));
+      Value *EP = PB.CreateCall(ErrLoc, {});
+      Value *E  = PB.CreateLoad(I32, EP);
+      Value *Fb = PB.CreateAnd(IsErr,
+			       PB.CreateOr(PB.CreateICmpEQ(E, ConstantInt::get(I32,38)),
+					   PB.CreateICmpEQ(E, ConstantInt::get(I32,18))),
+			       "cfr.need.fb");
+      PB.CreateCondBr(Fb, Gtail, Check);          // fb -> original loop entry
+
+      IRBuilder<> CB(Check);
+      CB.CreateCondBr(CB.CreateICmpSGT(R0, ConstantInt::get(SizeTy,0)),
+                      Loop, I.Done);            // was I.ExitBB
+      IRBuilder<> LB(Loop);
+      Value *R = emitCfr(LB);
+      LB.CreateCondBr(LB.CreateICmpSGT(R, ConstantInt::get(SizeTy,0)),
+                      Loop, I.Done);            // was I.ExitBB
+
+      NumCFRLoops++;
+      logMessage("[IOOpt] SUCCESS: promoted read/write copy loop to "
+                 "copy_file_range with ENOSYS/EXDEV fallback (original loop "
+                 "preserved).");
+    }
+
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       if (!EnableIOOpt || !EnableCopyFileRange) return PreservedAnalyses::all();
       // copy_file_range only makes sense on seekable/regular files.
@@ -2660,6 +2930,27 @@ namespace {
           FAM.invalidate(F, PreservedAnalyses::none()); // block-split -> refetch DT
         }
       }
+      if (EnableCFRLoops) {
+        LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+        DominatorTree &DTc = FAM.getResult<DominatorTreeAnalysis>(F);
+        for (Loop *L : LI.getLoopsInPreorder()) {
+          SmallVector<CallInst*,4> Reads; CallInst *W=nullptr;
+          if (!recognizeCopyLoopCandidate(L, DTc, Reads, W)) continue;
+	  if (EnableCFRFallback) {
+            CfrLoopInfo Info;
+            if (analyzeCfrLoopStructure(L, W, DTc, Info)) {
+              transformCopyLoopFallback(Info);
+              Changed = true;
+              FAM.invalidate(F, PreservedAnalyses::none());
+              break;
+            }
+          } else {
+            transformCopyLoop(Reads, W);
+            Changed = true;
+          }
+        }
+      }
+
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
   };

@@ -28,7 +28,9 @@ def count_syscalls(binary_path):
 
         return {
             "write": int(write_match.group(1)) if write_match else 0,
-            "writev": int(writev_match.group(1)) if writev_match else 0
+            "writev": int(writev_match.group(1)) if writev_match else 0,
+            "pwrite": int(write_match.group(1)) if write_match else 0,
+            "pwritev": int(writev_match.group(1)) if writev_match else 0
         }
     except Exception as e:
         print(f"Error running strace on {binary_path}: {e}")
@@ -73,6 +75,9 @@ def main():
         print("-" * 45)
         print(f"{'write':<15} | {std_data['write']:<10} | {fast_data['write']:<10}")
         print(f"{'writev':<15} | {std_data['writev']:<10} | {fast_data['writev']:<10}")
+        print(f"{'pwrite':<15} | {std_data['pwrite']:<10} | {fast_data['pwrite']:<10}")
+        print(f"{'pwritev':<15} | {std_data['pwritev']:<10} | {fast_data['pwritev']:<10}")
+
         print("-" * 45)
         print(f"{'TOTAL I/O':<15} | {std_total:<10} | {fast_total:<10}")
         print("="*45)

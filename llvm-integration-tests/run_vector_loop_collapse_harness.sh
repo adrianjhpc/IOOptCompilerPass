@@ -2,7 +2,7 @@
 set -euo pipefail
 
 : "${PLUGIN:=/home/adrianj/IOOptCompilerPass/build/llvm-src/IOOpt.so}"
-: "${OPT:=/data/llvm-install/bin/opt}"          # 21.1.8: the proven plugin host
+: "${OPT:=/data/llvm-install/bin/opt}"          # the proven plugin host
 WORK=${WORK:-/tmp/ioopt-exec}
 DIR=$(dirname "$0")
 SRC=${SRC:-$DIR/vector_loop_collapse_harness.c}
@@ -29,8 +29,10 @@ CC="$(find_cc)" || {
 }
 echo "Using matched CC = $CC ($("$CC" --version | head -1))"
 
-PASSES='loop-simplify,lcssa,io-opt'                     # canonicalize, then io-opt
-FLAGS='-io-opt-loop-hoist-dynamic-trips -io-opt-loop-vectored'  # PLAIN, to opt
+PASSES='loop-simplify,lcssa,io-opt'      # canonicalize, then io-opt
+# PLAIN flags, passed to opt (which loads the plugin first). Includes the
+# copy_file_range loop promotion (step 2, no fallback) for case E.
+FLAGS='-io-opt-loop-hoist-dynamic-trips -io-opt-loop-vectored -io-opt-copy-file-range -io-opt-cfr-loops'
 
 # --- Baseline: plain -O2, no plugin. ---
 "$CC" -O2 -fno-inline "$SRC" -o "$WORK/base"
@@ -44,10 +46,11 @@ IO_ENABLE_LOGGING=1 "$OPT" -load-pass-plugin="$PLUGIN" -passes="$PASSES" \
 # --- Confirm the transforms actually fired (else "identical" is vacuous). ---
 echo "=== IOOpt activity ==="; grep '\[IOOpt\]' "$WORK/fire.log" || true
 need() { grep -q "$1" "$WORK/fire.log" || { echo "FAIL(fire): '$1' not seen"; exit 1; }; }
-need "Hoisted DYNAMIC WRITE"     # case A
-need "Hoisted DYNAMIC READ"      # case B
-need "DVLC collapsed"     # case D
-echo "All three transforms fired."
+need "Hoisted DYNAMIC WRITE"          # case A
+need "Hoisted DYNAMIC READ"           # case B
+need "DVLC collapsed"                 # case D
+need "promoted read/write copy loop"  # case E (copy_file_range loop)
+echo "All transforms fired."
 
 # --- Run baseline vs optimized and diff outputs. ---
 pass=0; fail=0
@@ -57,14 +60,35 @@ check() {
   else echo "FAIL  $1 (outputs differ)"; fail=$((fail+1)); fi
 }
 N=1000
+
+# Case A: Tier-1 dynamic-N contiguous pwrite -> one pwrite(N*BLK) in the exit.
 "$WORK/base" A $N "$WORK/base.A"; "$WORK/opt" A $N "$WORK/opt.A"; check A
+
+# Case C: N==0 edge of case A (merged length 0 -> benign no-op).
 "$WORK/base" A 0  "$WORK/base.C"; "$WORK/opt" A 0  "$WORK/opt.C"; check C
+
+# Reference input for the read-based cases (N*4096 bytes, NOT 64K-aligned).
 "$WORK/base" A $N "$WORK/ref.in"
+
+# Case B: Tier-1 dynamic-N contiguous pread -> one pread(N*BLK) in the preheader.
 "$WORK/base" B $N "$WORK/base.B" "$WORK/ref.in"
 "$WORK/opt"  B $N "$WORK/opt.B"  "$WORK/ref.in"; check B
 cmp -s "$WORK/opt.B" "$WORK/ref.in" && echo "PASS  B==input" \
      || { echo "FAIL  B!=input"; fail=$((fail+1)); }
+
+# Case D: Tier-2 const-N scattered pwrite -> one pwritev.
 "$WORK/base" D "$WORK/base.D"; "$WORK/opt" D "$WORK/opt.D"; check D
+
+# Case E: copy loop -> copy_file_range. Copy ref.in both ways, diff, and confirm
+# the copy equals the input end-to-end. ref.in is N*4096 = 4,096,000 bytes, i.e.
+# NOT a multiple of the 64 KiB copy buffer, so a short final chunk exercises the
+# EOF/short-copy path.
+# NOTE: step-2 promotion has NO fallback -- keep src and dst on the SAME
+# filesystem/mount (WORK default /tmp) so copy_file_range does not hit EXDEV.
+"$WORK/base" E "$WORK/base.E" "$WORK/ref.in"
+"$WORK/opt"  E "$WORK/opt.E"  "$WORK/ref.in"; check E
+cmp -s "$WORK/opt.E" "$WORK/ref.in" && echo "PASS  E==input" \
+     || { echo "FAIL  E!=input"; fail=$((fail+1)); }
 
 echo "=================================================="
 echo "PASS=$pass FAIL=$fail"

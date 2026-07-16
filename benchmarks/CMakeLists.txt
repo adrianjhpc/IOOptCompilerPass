@@ -188,6 +188,40 @@ add_custom_command(
 add_executable(lto_fast ${LTO_OBJ})
 set_target_properties(lto_fast PROPERTIES LINKER_LANGUAGE CXX)
 
+# Loop Collapsing benchmark
+
+set(SRC_FILE ${CMAKE_CURRENT_SOURCE_DIR}/loop_benchmark.cpp)
+set(BC_FILE ${CMAKE_CURRENT_BINARY_DIR}/loop_benchmark.bc)
+set(OPT_BC_FILE ${CMAKE_CURRENT_BINARY_DIR}/loop_benchmark.opt.bc)
+set(OBJ_FILE ${CMAKE_CURRENT_BINARY_DIR}/loop_benchmark.opt.o)
+
+# Baseline
+add_executable(loop_standard ${SRC_FILE})
+target_compile_options(loop_standard PRIVATE -O3 -fno-inline)
+
+# Optimised
+add_custom_command(
+    OUTPUT ${BC_FILE}
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -emit-llvm -c ${SRC_FILE} -o ${BC_FILE} -I${CMAKE_SOURCE_DIR}/include -I${CMAKE_BINARY_DIR}/include
+    DEPENDS ${SRC_FILE}
+)
+
+add_custom_command(
+    OUTPUT ${OPT_BC_FILE}
+    COMMAND opt -load-pass-plugin=$<TARGET_FILE:IOOpt> -passes="io-opt" ${BC_FILE} -o ${OPT_BC_FILE}
+    DEPENDS ${BC_FILE} IOOpt
+)
+
+add_custom_command(
+    OUTPUT ${OBJ_FILE}
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -c ${OPT_BC_FILE} -o ${OBJ_FILE}
+    DEPENDS ${OPT_BC_FILE}
+)
+
+add_executable(loop_fast ${OBJ_FILE})
+set_target_properties(loop_fast PROPERTIES LINKER_LANGUAGE CXX)
+
+
 # MPI-IO Benchmarks (HPC Evaluation)
 # MPI-IO Benchmark
 if(MPI_CXX_FOUND)
