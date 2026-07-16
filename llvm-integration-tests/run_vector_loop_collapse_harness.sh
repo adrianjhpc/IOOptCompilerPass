@@ -95,3 +95,43 @@ echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ] && echo "ALL EXECUTION TESTS PASSED" \
                   || { echo "EXECUTION TESTS FAILED"; exit 1; }
 
+# --- Case F: deterministically exercise the copy_file_range FALLBACK path. ---
+# Cross-fs EXDEV is unreliable (cfr works cross-fs on modern kernels), so instead
+# LD_PRELOAD a shim that makes copy_file_range fail with EXDEV. This forces the
+# probe -> original-loop fallback edge on any kernel. The shim prints a marker so
+# we can confirm the probe (hence the transform) actually fired -- otherwise an
+# untransformed binary would silently pass this test.
+SHIM_C="$WORK/cfr_exdev_shim.c"
+SHIM_SO="$WORK/cfr_exdev_shim.so"
+cat > "$SHIM_C" <<'EOF'
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+ssize_t copy_file_range(int in, off_t *oi, int out, off_t *oo,
+                        size_t len, unsigned int flags) {
+    (void)in; (void)oi; (void)out; (void)oo; (void)len; (void)flags;
+    static const char m[] = "SHIM:EXDEV\n";
+    write(2, m, sizeof(m) - 1);   // marker on stderr; write() avoids recursion
+    errno = 18;                   // EXDEV
+    return -1;
+}
+EOF
+"$CC" -O2 -fPIC -shared "$SHIM_C" -o "$SHIM_SO"
+
+# Run the OPTIMIZED binary with the shim so every copy_file_range returns EXDEV
+# -> the probe must fall back to the preserved read/write loop. Reuse ref.in.
+LD_PRELOAD="$SHIM_SO" "$WORK/opt" E "$WORK/opt.F" "$WORK/ref.in" 2> "$WORK/F.err"
+
+if grep -q "SHIM:EXDEV" "$WORK/F.err"; then
+  echo "  (confirmed: probe copy_file_range fired and was forced to EXDEV)"
+else
+  echo "FAIL  F (shim marker absent -> transform/probe did NOT fire)"
+  fail=$((fail+1))
+fi
+if cmp -s "$WORK/opt.F" "$WORK/ref.in"; then
+  echo "PASS  F fallback (EXDEV forced, output identical to input)"; pass=$((pass+1))
+else
+  echo "FAIL  F fallback (output differs after EXDEV fallback)"; fail=$((fail+1))
+fi
+
